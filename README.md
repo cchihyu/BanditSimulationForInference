@@ -47,6 +47,144 @@ python run.py \
 
 ---
 
+## Reproducing Figure 2 and Figure 3 experiments
+
+The following commands are written in the same style as the small experiment above. Each code box runs one panel/experiment family over the corresponding values of `T_offline`.
+
+The full paper settings are computationally expensive: `T=500`, `offline_reps=1000`, `alphas=0.10` for 90% confidence intervals, and `infer_reps=20000` for BSI Monte Carlo rollouts. For a quick dry run, reduce `--offline_reps` and `--infer_reps` first.
+
+Create the output folders once before running the commands:
+
+```bash
+mkdir -p results/figure2 results/figure3 figures
+```
+
+### Figure 2, left panel: Gaussian rewards, `pi0 = epsilon_greedy`, `pi1 = epsilon_greedy`
+
+This reproduces the known-parametric Gaussian setting with arm means `(0.1, 0.2, 0.2)`, standard deviations `(1, 1, 1)`, and unknown reward variance.
+
+```bash
+TOFFS="100 150 250 500 1000 3000"
+
+for TOFF in $TOFFS; do
+  python run.py \
+      --env normal \
+      --mus 0.1 0.2 0.2 \
+      --sigmas 1.0 1.0 1.0 \
+      --estimate_sigma \
+      --pi0 epsilon_greedy \
+      --pi1 epsilon_greedy \
+      --T 500 \
+      --T_offline $TOFF \
+      --offline_reps 1000 \
+      --alphas 0.10 \
+      --infer_reps 20000 \
+      --n_policy_value_mc 20000 \
+      --n_eval_prob_mc 2000 \
+      --weight_modes one_step \
+      --run_naive_t_test \
+      --no-save_logged_data \
+      --n_jobs 8 \
+      --save_dir results/figure2 \
+      --tag fig2_gaussian_eps_eps
+done
+```
+
+### Figure 2, middle panel: Bernoulli rewards, `pi0 = ts_bernoulli`, `pi1 = ts_bernoulli`
+
+This reproduces the known-parametric Bernoulli setting with arm means `(0.35, 0.5, 0.6)` and Thompson Sampling for both the logging and evaluation policies.
+
+```bash
+TOFFS="100 150 250 500 1000 3000"
+
+for TOFF in $TOFFS; do
+  python run.py \
+      --env bernoulli \
+      --mus 0.35 0.5 0.6 \
+      --pi0 ts_bernoulli \
+      --pi1 ts_bernoulli \
+      --T 500 \
+      --T_offline $TOFF \
+      --offline_reps 1000 \
+      --alphas 0.10 \
+      --infer_reps 20000 \
+      --n_policy_value_mc 20000 \
+      --n_eval_prob_mc 2000 \
+      --weight_modes one_step \
+      --run_naive_t_test \
+      --no-save_logged_data \
+      --n_jobs 8 \
+      --save_dir results/figure2 \
+      --tag fig2_bernoulli_ts_ts
+done
+```
+
+### Figure 2, right panel: Bernoulli rewards, `pi0 = uniform`, `pi1 = ts_bernoulli`
+
+This reproduces the known-parametric Bernoulli setting with uniform logging and Thompson Sampling as the evaluation policy.
+
+```bash
+TOFFS="100 150 250 500 1000 3000"
+
+for TOFF in $TOFFS; do
+  python run.py \
+      --env bernoulli \
+      --mus 0.35 0.5 0.6 \
+      --pi0 uniform \
+      --pi1 ts_bernoulli \
+      --T 500 \
+      --T_offline $TOFF \
+      --offline_reps 1000 \
+      --alphas 0.10 \
+      --infer_reps 20000 \
+      --n_policy_value_mc 20000 \
+      --n_eval_prob_mc 2000 \
+      --weight_modes one_step \
+      --run_naive_t_test \
+      --no-save_logged_data \
+      --n_jobs 8 \
+      --save_dir results/figure2 \
+      --tag fig2_bernoulli_uniform_ts
+done
+```
+
+### Figure 3: Beta rewards, `pi0 = ts_normal`, `pi1 = ts_normal`
+
+This reproduces the sub-Gaussian reward-distribution experiment. The reward distributions are Beta with parameters `(0.35, 0.65)`, `(0.5, 0.5)`, and `(0.5, 0.5)`. The command below runs both BSI variance rules used in the figure: `hoeffding` and `empirical_variance`.
+
+```bash
+TOFFS="100 150 200 250 500"
+VAR_RULES="hoeffding empirical_variance"
+
+for VAR_RULE in $VAR_RULES; do
+  for TOFF in $TOFFS; do
+    python run.py \
+        --env beta \
+        --beta_alphas 0.35 0.5 0.5 \
+        --beta_betas 0.65 0.5 0.5 \
+        --var_estimation_beta $VAR_RULE \
+        --pi0 ts_normal \
+        --pi1 ts_normal \
+        --T 500 \
+        --T_offline $TOFF \
+        --offline_reps 1000 \
+        --alphas 0.10 \
+        --infer_reps 20000 \
+        --n_policy_value_mc 20000 \
+        --n_eval_prob_mc 2000 \
+        --weight_modes one_step \
+        --run_naive_t_test \
+        --no-save_logged_data \
+        --n_jobs 8 \
+        --save_dir results/figure3 \
+        --tag fig3_beta_ts_ts
+  done
+done
+```
+
+
+---
+
 ## Command-line arguments
 
 `run.py` uses an `argparse` parser to define one experiment configuration. The
