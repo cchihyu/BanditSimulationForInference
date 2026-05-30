@@ -4,20 +4,6 @@ Multi-arm bandit algorithms are increasingly used in online platforms, clinical 
 
 ---
 
-## Repository structure
-
-```
-.
-├── run.py                 # Main entry point: run experiments and save results
-├── inference.py           # BSI inference classes
-├── baselines.py           # OPE baseline intervals (ELFCB, IPW, CADR, DR, Naive-t)
-├── algorithms.py          # Bandit algorithm implementations (policies)
-├── environments.py        # Reward environment definitions
-└── environment.yml        # Conda environment specification
-```
-
----
-
 ## Quick start
 
 ### 1. Set up the environment
