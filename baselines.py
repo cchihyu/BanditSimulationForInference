@@ -9,7 +9,10 @@ from numba import njit
 from scipy.optimize import brentq
 from scipy.stats import f, norm, t
 
-from bsi.inference import bandit_exp_runner
+try:
+    from bsi.inference import bandit_exp_runner
+except ModuleNotFoundError:
+    from inference import bandit_exp_runner
 
 
 # Avoid import-time cache failures in environments where Numba cannot

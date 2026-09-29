@@ -1,7 +1,11 @@
 import argparse
+import csv
 import json
 import os
+import subprocess
 import sys
+import tempfile
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 from tqdm.auto import tqdm
@@ -92,7 +96,23 @@ def build_parser():
     parser.add_argument("--obs_sigma", type=float, default=1.0)
     parser.add_argument("--prior_alpha", type=float, default=1.0)
     parser.add_argument("--prior_beta", type=float, default=1.0)
-    parser.add_argument("--infer_reps", type=int, default=200)
+    parser.add_argument(
+        "--infer_reps",
+        type=int,
+        default=None,
+        help="Inner BSI Monte Carlo rollouts. If --select_M is enabled, this is overwritten by selected M.",
+    )
+    parser.add_argument(
+        "--select_M",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically select the BSI inner Monte Carlo size M before running BSI.",
+    )
+    parser.add_argument("--Mmax", type=int, default=200000, help="Upper budget for automatic M selection.")
+    parser.add_argument("--M_m0", type=int, default=1000, help="Pilot rollouts used for automatic M selection.")
+    parser.add_argument("--M_bootstrap_reps", type=int, default=1000, help="Bootstrap resamples used for automatic M selection.")
+    parser.add_argument("--M_tau", type=float, default=0.05, help="Tail probability used for automatic M selection.")
+    parser.add_argument("--M_rel_eps", type=float, default=0.05, help="Target relative MC error used for automatic M selection.")
     parser.add_argument("--estimate_sigma", action="store_true", default=False)
     # input variance estimation methods
     parser.add_argument( 
@@ -291,6 +311,20 @@ def summarize_intervals(intervals, centers, theta_true, theta_true_se):
 
 
 def finalize_args(args):
+    if not hasattr(args, "select_M"):
+        args.select_M = False
+    if not hasattr(args, "Mmax"):
+        args.Mmax = 200000
+    if not hasattr(args, "M_m0"):
+        args.M_m0 = 1000
+    if not hasattr(args, "M_bootstrap_reps"):
+        args.M_bootstrap_reps = 1000
+    if not hasattr(args, "M_tau"):
+        args.M_tau = 0.05
+    if not hasattr(args, "M_rel_eps"):
+        args.M_rel_eps = 0.05
+    if getattr(args, "infer_reps", None) is None:
+        args.infer_reps = 200
     if not hasattr(args, "run_cadr_rescaled"):
         args.run_cadr_rescaled = False
     if not hasattr(args, "dr_bootstrap_reps"):
@@ -596,6 +630,113 @@ def run_delta_method(args_dict, env, offline_data, is_adaptive_pi0, rep_idx):
     }
 
 
+def _comma_join(values):
+    if values is None:
+        return None
+    return ",".join(str(x) for x in values)
+
+
+def select_inner_reps_for_config(args):
+    mode = "subgaussian" if args.env == "beta" else "mab"
+    with tempfile.NamedTemporaryFile(
+        prefix="selected_M_",
+        suffix=".csv",
+        delete=False,
+    ) as tmp:
+        out_path = tmp.name
+
+    cmd = [
+        sys.executable,
+        os.path.join(PACKAGE_ROOT, "find_M.py"),
+        "--mode",
+        mode,
+        "--T",
+        str(args.T),
+        "--T_offline_grid",
+        str(args.T_offline),
+        "--m0",
+        str(args.M_m0),
+        "--B",
+        str(args.M_bootstrap_reps),
+        "--Mmax",
+        str(args.Mmax),
+        "--tau",
+        str(args.M_tau),
+        "--rel_eps",
+        str(args.M_rel_eps),
+        "--seed",
+        str(args.algo_seed),
+        "--rep_idx",
+        "0",
+        "--out",
+        out_path,
+    ]
+    if mode == "mab":
+        cmd.extend(["--env", args.env])
+    if args.mus is not None:
+        cmd.extend(["--mus", _comma_join(args.mus)])
+    if args.sigmas is not None:
+        cmd.extend(["--sigmas", _comma_join(args.sigmas)])
+    if args.beta_alphas is not None:
+        cmd.extend(["--beta_alphas", _comma_join(args.beta_alphas)])
+    if args.beta_betas is not None:
+        cmd.extend(["--beta_betas", _comma_join(args.beta_betas)])
+    if args.behavior_policy is not None:
+        cmd.extend(["--behavior_policy", _comma_join(args.behavior_policy)])
+    if args.pi0 is not None:
+        cmd.extend(["--pi0", args.pi0])
+    if args.pi1 is not None:
+        cmd.extend(["--pi1", args.pi1])
+    if args.estimate_sigma:
+        cmd.append("--estimate_sigma")
+    cmd.extend(
+        [
+            "--var_estimation_beta",
+            args.var_estimation_beta,
+            "--epsilon",
+            str(args.epsilon),
+            "--m",
+            str(args.m),
+            "--batch_size",
+            str(args.batch_size),
+            "--ucb_c",
+            str(args.ucb_c),
+            "--prior_mean",
+            str(args.prior_mean),
+            "--prior_var",
+            str(args.prior_var),
+            "--obs_sigma",
+            str(args.obs_sigma),
+            "--prior_alpha",
+            str(args.prior_alpha),
+            "--prior_beta",
+            str(args.prior_beta),
+        ]
+    )
+
+    try:
+        subprocess.run(cmd, check=True)
+        with open(out_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+
+    if len(rows) != 1:
+        raise RuntimeError(f"Expected one M-selection row, got {len(rows)}.")
+    row = rows[0]
+    m_selected = int(float(row["m_selected"]))
+    m_star = int(float(row["m_star"]))
+    if str(row.get("m_exceeds_budget", "")).lower() in {"true", "1"}:
+        warnings.warn(
+            f"Selected M={m_star} exceeds Mmax={args.Mmax}; using M={m_selected}.",
+            RuntimeWarning,
+        )
+    return m_selected, row
+
+
 def build_rep_result(args_dict, rep_idx, offline_data, behavior_probs, is_adaptive_pi0, delta_summary=None):
     args_ns = argparse.Namespace(**args_dict)
     env = make_env(args_ns)
@@ -806,6 +947,15 @@ def build_summary(args, per_rep, theta_true, theta_true_se):
 def run_config(args, theta_true=None, theta_true_se=None, finalize=True):
     if finalize:
         args = finalize_args(args)
+    if args.select_M and not args.baselines_only:
+        selected_m, selected_m_row = select_inner_reps_for_config(args)
+        args.infer_reps = selected_m
+        args.selected_M = selected_m_row
+        print(
+            f"Selected M={selected_m} "
+            f"(raw m_star={selected_m_row['m_star']}, Mmax={args.Mmax})",
+            flush=True,
+        )
     args_dict = vars(args).copy()
     weighted_methods = enabled_weighted_baseline_methods(args)
 

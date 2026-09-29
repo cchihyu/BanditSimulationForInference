@@ -1,6 +1,15 @@
 import numpy as np
 from scipy.stats import norm
 
+from algorithms import (
+    BatchExploreThenGreedy,
+    EpsilonGreedy,
+    ExploreThenCommit,
+    TSBernoulli,
+    TSNormal,
+    UCB,
+    UniformSampling,
+)
 from environments import *
 
 
@@ -62,6 +71,229 @@ def bandit_exp_runner(
         else 0.0,
         "std_avg_reward": avg_rewards.std(ddof=1) if n_reps > 1 else 0.0,
     }
+
+
+def _sample_categorical_rows(probs, rng):
+    draws = rng.random(probs.shape[0])
+    cdf = np.cumsum(probs, axis=1)
+    return (draws[:, None] > cdf[:, :-1]).sum(axis=1).astype(int)
+
+
+def _sample_vectorized_rewards(env, actions, rng):
+    if isinstance(env, NormalRewardEnv):
+        return rng.normal(env.mus[actions], env.sigmas[actions]).astype(float)
+    if isinstance(env, BernoulliRewardEnv):
+        return rng.binomial(1, env.mus[actions]).astype(float)
+    if isinstance(env, BetaRewardEnv):
+        return rng.beta(env.alpha_params[actions], env.beta_params[actions]).astype(float)
+    raise TypeError(f"Unsupported environment for vectorized MAB runner: {type(env)!r}")
+
+
+def _summarize_rollouts(env, all_actions, all_rewards, all_probs, base_exp_seed, T):
+    total_rewards = all_rewards.sum(axis=1)
+    avg_rewards = total_rewards / T
+    n_reps = all_rewards.shape[0]
+    return {
+        "table_seed": None,
+        "exp_seed": base_exp_seed,
+        "env": env,
+        "n_rep": n_reps,
+        "T": T,
+        "all_actions": all_actions,
+        "all_rewards": all_rewards,
+        "all_probs": all_probs,
+        "mean_total_reward": total_rewards.mean(),
+        "se_total_reward": total_rewards.std(ddof=1) / np.sqrt(n_reps)
+        if n_reps > 1
+        else 0.0,
+        "std_total_reward": total_rewards.std(ddof=1) if n_reps > 1 else 0.0,
+        "mean_avg_reward": avg_rewards.mean(),
+        "se_avg_reward": avg_rewards.std(ddof=1) / np.sqrt(n_reps)
+        if n_reps > 1
+        else 0.0,
+        "std_avg_reward": avg_rewards.std(ddof=1) if n_reps > 1 else 0.0,
+    }
+
+
+def bandit_exp_runner_vectorized(
+    env,
+    algo_builder,
+    T,
+    n_reps=1,
+    base_exp_seed=1013,
+    table_seed=2026,
+    table_renew=False,
+    adaptive=False,
+):
+    """
+    Vectorized MAB rollout simulator over independent inner Monte Carlo reps.
+
+    This is distributionally equivalent to ``bandit_exp_runner`` for the
+    standard policies below, but it intentionally uses a single vectorized RNG
+    stream rather than one ``default_rng(seed + rep)`` object per replication.
+    Therefore individual simulated trajectories are not bit-for-bit identical to
+    the legacy runner, while the bandit state updates and reward law are the
+    same.
+    """
+    if adaptive or not table_renew:
+        return bandit_exp_runner(
+            env=env,
+            algo_builder=algo_builder,
+            T=T,
+            n_reps=n_reps,
+            base_exp_seed=base_exp_seed,
+            table_seed=table_seed,
+            table_renew=table_renew,
+            adaptive=adaptive,
+        )
+
+    probe = algo_builder(base_exp_seed)
+    supported = (
+        UniformSampling,
+        EpsilonGreedy,
+        ExploreThenCommit,
+        BatchExploreThenGreedy,
+        UCB,
+        TSNormal,
+        TSBernoulli,
+    )
+    if not isinstance(probe, supported):
+        return bandit_exp_runner(
+            env=env,
+            algo_builder=algo_builder,
+            T=T,
+            n_reps=n_reps,
+            base_exp_seed=base_exp_seed,
+            table_seed=table_seed,
+            table_renew=table_renew,
+            adaptive=adaptive,
+        )
+
+    n_actions = env.n_actions
+    algo_rng = np.random.default_rng(base_exp_seed)
+    reward_rng = np.random.default_rng(table_seed)
+    all_actions = np.zeros((n_reps, T), dtype=int)
+    all_rewards = np.zeros((n_reps, T), dtype=float)
+    counts = np.zeros((n_reps, n_actions), dtype=int)
+    reward_sums = np.zeros((n_reps, n_actions), dtype=float)
+    rows = np.arange(n_reps)
+
+    if isinstance(probe, TSNormal):
+        post_mean = np.tile(probe.post_mean, (n_reps, 1)).astype(float)
+        post_var = np.tile(probe.post_var, (n_reps, 1)).astype(float)
+        obs_var = float(probe.obs_var)
+    elif isinstance(probe, TSBernoulli):
+        alpha = np.tile(probe.alpha, (n_reps, 1)).astype(float)
+        beta = np.tile(probe.beta, (n_reps, 1)).astype(float)
+    elif isinstance(probe, ExploreThenCommit):
+        committed = np.full(n_reps, -1, dtype=int)
+    elif isinstance(probe, BatchExploreThenGreedy):
+        batch_size = int(probe.batch_size)
+        current_batch = np.zeros((n_reps, batch_size), dtype=int)
+        batch_pos = np.full(n_reps, batch_size, dtype=int)
+
+    for t in range(T):
+        if isinstance(probe, UniformSampling):
+            actions = algo_rng.integers(n_actions, size=n_reps, dtype=int)
+
+        elif isinstance(probe, EpsilonGreedy):
+            if t < n_actions:
+                actions = np.full(n_reps, t, dtype=int)
+            else:
+                means = np.divide(
+                    reward_sums,
+                    counts,
+                    out=np.zeros_like(reward_sums, dtype=float),
+                    where=counts > 0,
+                )
+                greedy = np.argmax(means, axis=1)
+                probs = np.full((n_reps, n_actions), probe.epsilon / n_actions)
+                probs[rows, greedy] += 1.0 - probe.epsilon
+                actions = _sample_categorical_rows(probs, algo_rng)
+
+        elif isinstance(probe, ExploreThenCommit):
+            actions = committed.copy()
+            active = committed < 0
+            if np.any(active):
+                needs_explore = counts[active] < probe.m
+                explore_any = needs_explore.any(axis=1)
+                active_rows = rows[active]
+                if np.any(explore_any):
+                    explore_rows = active_rows[explore_any]
+                    actions[explore_rows] = np.argmax(needs_explore[explore_any], axis=1)
+                if np.any(~explore_any):
+                    commit_rows = active_rows[~explore_any]
+                    means = np.divide(
+                        reward_sums[commit_rows],
+                        counts[commit_rows],
+                        out=np.zeros((commit_rows.size, n_actions), dtype=float),
+                        where=counts[commit_rows] > 0,
+                    )
+                    best = np.argmax(means, axis=1)
+                    committed[commit_rows] = best
+                    actions[commit_rows] = best
+
+        elif isinstance(probe, BatchExploreThenGreedy):
+            needs_explore = counts < probe.m
+            explore_any = needs_explore.any(axis=1)
+            actions = np.empty(n_reps, dtype=int)
+            if np.any(explore_any):
+                actions[explore_any] = np.argmax(needs_explore[explore_any], axis=1)
+            greedy_rows = rows[~explore_any]
+            if greedy_rows.size:
+                rebuild = greedy_rows[batch_pos[greedy_rows] >= batch_size]
+                if rebuild.size:
+                    means = np.divide(
+                        reward_sums[rebuild],
+                        counts[rebuild],
+                        out=np.zeros((rebuild.size, n_actions), dtype=float),
+                        where=counts[rebuild] > 0,
+                    )
+                    current_batch[rebuild] = np.argsort(means, axis=1)[:, -batch_size:][:, ::-1]
+                    batch_pos[rebuild] = 0
+                pos = batch_pos[greedy_rows]
+                actions[greedy_rows] = current_batch[greedy_rows, pos]
+                batch_pos[greedy_rows] += 1
+
+        elif isinstance(probe, UCB):
+            untried = counts == 0
+            explore_any = untried.any(axis=1)
+            actions = np.empty(n_reps, dtype=int)
+            if np.any(explore_any):
+                actions[explore_any] = np.argmax(untried[explore_any], axis=1)
+            exploit_rows = rows[~explore_any]
+            if exploit_rows.size:
+                means = reward_sums[exploit_rows] / counts[exploit_rows]
+                bonus = probe.c * np.sqrt(np.log(t + 1) / counts[exploit_rows])
+                actions[exploit_rows] = np.argmax(means + bonus, axis=1)
+
+        elif isinstance(probe, TSNormal):
+            samples = algo_rng.normal(post_mean, np.sqrt(post_var))
+            actions = np.argmax(samples, axis=1)
+
+        elif isinstance(probe, TSBernoulli):
+            samples = algo_rng.beta(alpha, beta)
+            actions = np.argmax(samples, axis=1)
+
+        rewards = _sample_vectorized_rewards(env, actions, reward_rng)
+        all_actions[:, t] = actions
+        all_rewards[:, t] = rewards
+
+        counts[rows, actions] += 1
+        reward_sums[rows, actions] += rewards
+
+        if isinstance(probe, TSNormal):
+            v0 = post_var[rows, actions]
+            m0 = post_mean[rows, actions]
+            v1 = 1.0 / (1.0 / v0 + 1.0 / obs_var)
+            m1 = v1 * (m0 / v0 + rewards / obs_var)
+            post_var[rows, actions] = v1
+            post_mean[rows, actions] = m1
+        elif isinstance(probe, TSBernoulli):
+            alpha[rows, actions] += rewards
+            beta[rows, actions] += 1.0 - rewards
+
+    return _summarize_rollouts(env, all_actions, all_rewards, None, base_exp_seed, T)
 
 
 def compute_arm_estimates_adaptive(
@@ -203,6 +435,77 @@ def compute_arm_mean_std(all_actions, all_rewards, n_actions):
     }
 
 
+def normal_rollout_gradients(
+    all_actions,
+    all_rewards,
+    hat_mu,
+    hat_sigma2,
+    estimate_sigma=False,
+    average=True,
+):
+    all_actions = np.asarray(all_actions, dtype=int)
+    all_rewards = np.asarray(all_rewards, dtype=float)
+    hat_mu = np.asarray(hat_mu, dtype=float)
+    hat_sigma2 = np.asarray(hat_sigma2, dtype=float)
+    n_reps, T = all_actions.shape
+    n_actions = hat_mu.shape[0]
+
+    future_excluding_current = (
+        np.cumsum(all_rewards[:, ::-1], axis=1)[:, ::-1] - all_rewards
+    )
+    residuals = all_rewards - hat_mu[all_actions]
+    s2 = hat_sigma2[all_actions]
+    scores_mu = residuals / s2
+    contrib_mu = (1.0 + scores_mu * future_excluding_current) / T
+
+    grad_mu = np.zeros((n_reps, n_actions), dtype=float)
+    for action in range(n_actions):
+        grad_mu[:, action] = np.sum(
+            np.where(all_actions == action, contrib_mu, 0.0),
+            axis=1,
+        )
+
+    if not estimate_sigma:
+        return grad_mu.mean(axis=0) if average else grad_mu
+
+    scores_sigma2 = -0.5 / s2 + residuals**2 / (2.0 * s2**2)
+    contrib_sigma2 = (scores_sigma2 * future_excluding_current) / T
+    grad_sigma2 = np.zeros((n_reps, n_actions), dtype=float)
+    for action in range(n_actions):
+        grad_sigma2[:, action] = np.sum(
+            np.where(all_actions == action, contrib_sigma2, 0.0),
+            axis=1,
+        )
+
+    grads = np.empty((n_reps, 2 * n_actions), dtype=float)
+    grads[:, 0::2] = grad_mu
+    grads[:, 1::2] = grad_sigma2
+    return grads.mean(axis=0) if average else grads
+
+
+def bernoulli_rollout_gradients(all_actions, all_rewards, hat_mu, average=True):
+    all_actions = np.asarray(all_actions, dtype=int)
+    all_rewards = np.asarray(all_rewards, dtype=float)
+    hat_mu = np.clip(np.asarray(hat_mu, dtype=float), 1e-6, 1.0 - 1e-6)
+    n_reps, T = all_actions.shape
+    n_actions = hat_mu.shape[0]
+
+    future_excluding_current = (
+        np.cumsum(all_rewards[:, ::-1], axis=1)[:, ::-1] - all_rewards
+    )
+    mu_a = hat_mu[all_actions]
+    scores = (all_rewards - mu_a) / (mu_a * (1.0 - mu_a))
+    contrib = (1.0 + scores * future_excluding_current) / T
+
+    grads = np.zeros((n_reps, n_actions), dtype=float)
+    for action in range(n_actions):
+        grads[:, action] = np.sum(
+            np.where(all_actions == action, contrib, 0.0),
+            axis=1,
+        )
+    return grads.mean(axis=0) if average else grads
+
+
 # Base class: collect the common information
 class BaseInference:
     def __init__(
@@ -235,48 +538,14 @@ class AdaptiveNormalBSI(BaseInference):
     def compute_se(
         self, all_actions, all_rewards, hat_mu, hat_sigma2, V
     ): # compute sqrt of gvg
-        
-        all_actions = np.asarray(all_actions, dtype=int)
-        all_rewards = np.asarray(all_rewards, dtype=float)
-        n_reps, T = all_actions.shape
-        n_actions = len(hat_mu)
-        
-        # compute the gradient
-        grad_hat_mu = np.zeros(n_actions, dtype=float)
-
-        if self.estimate_sigma:
-            grad_hat_sigma2 = np.zeros(n_actions, dtype=float)
-
-        for rep in range(n_reps):
-            actions = all_actions[rep]  # (T,)
-            rewards = all_rewards[rep]  # (T,)
-
-            G = np.cumsum(rewards[::-1])[::-1]
-            G = np.concatenate([G, [0]])  # This defines G1 through G(T+1)
-            residuals = rewards - hat_mu[actions]  # (R_t - mu_a), shape (T,)
-            s2 = hat_sigma2[actions]  # sigma_a^2 for each t, shape (T,)
-
-            # ── mu gradient ──────────────────────────────────────────────
-            scores_mu = residuals / (s2)  # (T,)
-            contrib_mu = (1.0 + scores_mu * G[1:]) / T  # (T,)
-            np.add.at(grad_hat_mu, actions, contrib_mu)
-
-            # ── sigma^2 gradient (only when estimating sigma) ────────────
-            # score is -1/(2*sigma^2) + (R-mu)^2/(2*sigma^4)
-            if self.estimate_sigma:
-                scores_sigma2 = -0.5 / s2 + residuals**2 / (
-                    2.0 * s2**2
-                )  # FIXED: -0.5/s2
-                contrib_sigma2 = (scores_sigma2 * G[1:]) / T
-                np.add.at(grad_hat_sigma2, actions, contrib_sigma2)
-
-        grad_hat_mu /= n_reps
-        if self.estimate_sigma:
-            grad_hat_sigma2 /= n_reps
-        grad = grad_hat_mu
-        if self.estimate_sigma:
-            grad = np.stack([grad_hat_mu, grad_hat_sigma2], axis=1).ravel()
-
+        grad = normal_rollout_gradients(
+            all_actions,
+            all_rewards,
+            hat_mu,
+            hat_sigma2,
+            estimate_sigma=self.estimate_sigma,
+            average=True,
+        )
         return float(np.sqrt(grad @ V @ grad)), grad
 
         
@@ -319,7 +588,7 @@ class AdaptiveNormalBSI(BaseInference):
 
         # simulate pi1 on imagined environment
         imagined_env = NormalRewardEnv(mus=hat_mu, sigma=hat_sigma)
-        self.result = bandit_exp_runner(
+        self.result = bandit_exp_runner_vectorized(
             env=imagined_env,
             algo_builder=self.algo_builder2,
             T=self.T,
@@ -387,34 +656,12 @@ class AdaptiveBernoulliBSI(BaseInference):
         return np.clip(np.asarray(mu, dtype=float), self.eps, 1.0 - self.eps)
 
     def compute_se(self, all_actions, all_rewards, hat_mu, V):
-
-        all_actions = np.asarray(all_actions, dtype=int)
-        all_rewards = np.asarray(all_rewards, dtype=float)
-
-        n_reps, T = all_actions.shape
-        n_actions = self.true_env.n_actions
-        hat_mu = self._clip_mu(hat_mu) # for numerical stability
-
-        # compute the gradient of f ==========================================
-        grad_hat_mu = np.zeros(n_actions, dtype=float) #store the gradient of f
-
-        for rep in range(n_reps):
-            actions = all_actions[rep]
-            rewards = all_rewards[rep]
-
-            G = np.cumsum(rewards[::-1])[::-1]
-            G = np.concatenate([G, [0]])  # This defines G2 through G(T+1)
-
-            mu_a = hat_mu[actions] # (T,)
-
-            # Bernoulli score
-            scores_mu = (rewards - mu_a) / (mu_a * (1.0 - mu_a))
-
-            contrib_mu = (1+scores_mu * G[1:]) / T
-            np.add.at(grad_hat_mu, actions, contrib_mu)
-
-        grad_hat_mu /= n_reps # compute te expectation term
-
+        grad_hat_mu = bernoulli_rollout_gradients(
+            all_actions,
+            all_rewards,
+            self._clip_mu(hat_mu),
+            average=True,
+        )
         return float(np.sqrt(grad_hat_mu @ V @ grad_hat_mu)), grad_hat_mu
 
 
@@ -444,7 +691,7 @@ class AdaptiveBernoulliBSI(BaseInference):
 
         imagined_env = BernoulliRewardEnv(mus=hat_mu)
 
-        self.result = bandit_exp_runner(
+        self.result = bandit_exp_runner_vectorized(
             env=imagined_env,
             algo_builder=self.algo_builder2,
             T=self.T,
@@ -516,41 +763,14 @@ class NormalBSI(BaseInference):
         return np.diag(Sigma_diag)
 
     def compute_se(self, all_actions, all_rewards, hat_mu, hat_sigma2, offline_data):
-        all_actions = np.asarray(all_actions, dtype=int)
-        all_rewards = np.asarray(all_rewards, dtype=float)
-        n_reps, T = all_actions.shape
-        n_actions = self.true_env.n_actions
-
-        # ── Step 1: gradient of f w.r.t. lambda = (mu, sigma^2) ──────────
-        grad_hat_mu = np.zeros(n_actions, dtype=float)
-        if self.estimate_sigma:
-            grad_hat_sigma2 = np.zeros(n_actions, dtype=float)
-
-        for rep in range(n_reps):
-            actions = all_actions[rep]
-            rewards = all_rewards[rep]
-            G = np.cumsum(rewards[::-1])[::-1]
-            G = np.concatenate([G, [0]])  # G[t] = sum_{s=t}^T R_s
-            residuals = rewards - hat_mu[actions]
-            s2 = hat_sigma2[actions]
-
-            scores_mu = residuals / s2
-            np.add.at(grad_hat_mu, actions, (1.0 + scores_mu * G[1:]) / T)
-
-            if self.estimate_sigma:
-                scores_sigma2 = -0.5 / s2 + residuals**2 / (2.0 * s2**2)
-                np.add.at(grad_hat_sigma2, actions, (scores_sigma2 * G[1:]) / T)
-
-        grad_hat_mu /= n_reps
-        if self.estimate_sigma:
-            grad_hat_sigma2 /= n_reps
-
-        # ── Step 2: SE = sqrt( g^T Sigma g ) ─────────────────────────────
-        if self.estimate_sigma:
-            grad = np.stack([grad_hat_mu, grad_hat_sigma2], axis=1).ravel()
-        else:
-            grad = grad_hat_mu
-
+        grad = normal_rollout_gradients(
+            all_actions,
+            all_rewards,
+            hat_mu,
+            hat_sigma2,
+            estimate_sigma=self.estimate_sigma,
+            average=True,
+        )
         Sigma = self._compute_Sigma(hat_sigma2, offline_data)
         return np.sqrt(grad @ Sigma @ grad / offline_data['T']), grad
  
@@ -585,7 +805,7 @@ class NormalBSI(BaseInference):
         imagined_env = NormalRewardEnv(mus=hat_mu, sigma=np.sqrt(hat_sigma2))
 
         # ── simulate pi1 on imagined environment ─────────────────────────
-        self.result = bandit_exp_runner(
+        self.result = bandit_exp_runner_vectorized(
             env=imagined_env,
             algo_builder=self.algo_builder2,
             T=self.T,
@@ -641,34 +861,14 @@ class BernoulliBSI(BaseInference):
         return np.clip(np.asarray(mu, dtype=float), self.eps, 1.0 - self.eps)
 
     def compute_se(self, all_actions, all_rewards, hat_mu, offline_data):
-
-        all_actions = np.asarray(all_actions, dtype=int)
-        all_rewards = np.asarray(all_rewards, dtype=float)
-
-        n_reps, T = all_actions.shape
         n_actions = self.true_env.n_actions
         hat_mu = self._clip_mu(hat_mu) # for numerical stability
-
-        # compute the gradient of f ==========================================
-        grad_hat_mu = np.zeros(n_actions, dtype=float) #store the gradient of f
-
-        for rep in range(n_reps):
-            actions = all_actions[rep]
-            rewards = all_rewards[rep]
-
-            G = np.cumsum(rewards[::-1])[::-1]
-            G = np.concatenate([G, [0]])  # This defines G2 through G(T+1)
-
-            mu_a = hat_mu[actions] # (T,)
-
-            # Bernoulli score
-            scores_mu = (rewards - mu_a) / (mu_a * (1.0 - mu_a))
-
-            contrib_mu = (1+scores_mu * G[1:]) / T
-            np.add.at(grad_hat_mu, actions, contrib_mu)
-            #import ipdb; ipdb.set_trace()
-
-        grad_hat_mu /= n_reps # compute te expectation term
+        grad_hat_mu = bernoulli_rollout_gradients(
+            all_actions,
+            all_rewards,
+            hat_mu,
+            average=True,
+        )
         
         # compute sigma_pi0 ==========================================
         offline_actions = np.asarray(offline_data["all_actions"], dtype=int).flatten()
@@ -704,7 +904,7 @@ class BernoulliBSI(BaseInference):
 
         imagined_env = BernoulliRewardEnv(mus=hat_mu)
 
-        self.result = bandit_exp_runner(
+        self.result = bandit_exp_runner_vectorized(
             env=imagined_env,
             algo_builder=self.algo_builder2,
             T=self.T,

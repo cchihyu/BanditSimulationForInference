@@ -65,6 +65,7 @@ for TOFF in $TOFFS; do
       --offline_reps 1000 \
       --alphas 0.10 \
       --infer_reps 20000 \
+      --no-select_M \
       --n_policy_value_mc 20000 \
       --n_eval_prob_mc 2000 \
       --weight_modes one_step \
@@ -94,6 +95,7 @@ for TOFF in $TOFFS; do
       --offline_reps 1000 \
       --alphas 0.10 \
       --infer_reps 20000 \
+      --no-select_M \
       --n_policy_value_mc 20000 \
       --n_eval_prob_mc 2000 \
       --weight_modes one_step \
@@ -123,6 +125,7 @@ for TOFF in $TOFFS; do
       --offline_reps 1000 \
       --alphas 0.10 \
       --infer_reps 20000 \
+      --no-select_M \
       --n_policy_value_mc 20000 \
       --n_eval_prob_mc 2000 \
       --weight_modes one_step \
@@ -156,6 +159,7 @@ for VAR_RULE in $VAR_RULES; do
         --offline_reps 1000 \
         --alphas 0.10 \
         --infer_reps 20000 \
+        --no-select_M \
         --n_policy_value_mc 20000 \
         --n_eval_prob_mc 2000 \
         --weight_modes one_step \
@@ -211,13 +215,19 @@ Supported policy names:
 | `--T` | `50` | Online horizon for the target policy. |
 | `--T_offline` | `100` | Offline logged-data horizon. |
 | `--offline_reps` | `100` | Number of Monte Carlo replications. |
-| `--infer_reps` | `200` | Monte Carlo rollouts used inside BSI inference. |
+| `--infer_reps` | selected automatically | Monte Carlo rollouts used inside BSI inference. Used directly only with `--no-select_M`. |
 | `--alphas` | `0.05` | One or more significance levels, e.g. `--alphas 0.01 0.05 0.10`. |
 
 ### BSI-specific options
 
 | Argument | Default | Description |
 |---|---:|---|
+| `--select_M` / `--no-select_M` | on | Select the BSI inner Monte Carlo size before running BSI. |
+| `--Mmax` | `200000` | Upper budget for automatically selected `M`; if the estimated `M` is larger, the run uses `Mmax` and emits a warning. |
+| `--M_m0` | `1000` | Pilot inner rollouts used for M selection. |
+| `--M_bootstrap_reps` | `1000` | Bootstrap resamples used for M selection. |
+| `--M_tau` | `0.05` | Tail probability for the M-selection error criterion. |
+| `--M_rel_eps` | `0.05` | Target relative Monte Carlo error for the BSI width estimate. |
 | `--estimate_sigma` | off | Estimate arm reward standard deviations in normal-style BSI. |
 | `--var_estimation_beta` | `hoeffding` | Beta-normal BSI variance rule. Choose `hoeffding` or `empirical_variance`. |
 
@@ -256,6 +266,66 @@ To see the full parser directly, run:
 
 ```bash
 python run.py --help
+```
+
+## Contextual BSI Extension
+
+The original MAB implementation remains at the repository root. The contextual
+bandit extension is kept in the `contextual/` package so its modules do not
+collide with the original `algorithms.py`, `environments.py`, `baselines.py`,
+or `inference.py` files.
+
+Core contextual files:
+
+| Path | Purpose |
+|---|---|
+| `contextual/contextual_bsi.py` | Contextual BSI estimator and inner simulation runner. |
+| `contextual/algorithms.py` | Contextual ε-greedy and Thompson-sampling policies. |
+| `contextual/environments.py` | Linear Gaussian and logistic Bernoulli contextual reward models. |
+| `contextual/baselines.py` | Contextual IPW, DR, CADR, and ELFCB-style baselines. |
+| `contextual/simulation.py` | Small simulation helpers used by examples and M-selection. |
+| `contextual/select_inner_reps.py` | Pilot-bootstrap rule for selecting the BSI inner Monte Carlo size. |
+
+Use `find_M.py` to estimate the inner Monte Carlo size before launching large
+BSI experiments. It supports the original MAB setting, the sub-Gaussian Beta
+MAB setting, and contextual BSI:
+
+```bash
+python find_M.py --help
+
+python find_M.py \
+    --mode mab \
+    --env bernoulli \
+    --mus 0.35,0.5,0.6 \
+    --pi0 uniform \
+    --pi1 ts_bernoulli \
+    --T 500 \
+    --T_offline_grid 100,500,1000 \
+    --m0 1000 \
+    --B 1000 \
+    --out selected_M_mab.csv
+
+python find_M.py \
+    --mode subgaussian \
+    --beta_alphas 0.35,0.5,0.5 \
+    --beta_betas 0.65,0.5,0.5 \
+    --pi0 ts_normal \
+    --pi1 ts_normal \
+    --T 500 \
+    --T_offline_grid 100,500,1000 \
+    --m0 1000 \
+    --B 1000 \
+    --out selected_M_subgaussian.csv
+
+python find_M.py \
+    --mode contextual \
+    --contextual_envs linear_gaussian,logistic_bernoulli \
+    --pairs uni_ts,ts_ts,eps_eps \
+    --T 500 \
+    --T_offline_grid 100,500,1000 \
+    --m0 1000 \
+    --B 1000 \
+    --out selected_M_contextual.csv
 ```
 
 ## Methods
