@@ -285,6 +285,20 @@ Core contextual files:
 | `contextual/baselines.py` | Contextual IPW, DR, CADR, and ELFCB-style baselines. |
 | `contextual/simulation.py` | Small simulation helpers used by examples and M-selection. |
 | `contextual/select_inner_reps.py` | Pilot-bootstrap rule for selecting the BSI inner Monte Carlo size. |
+| `contextual/run_contextual.py` | Small command-line runner for a single contextual BSI example. |
+
+Run a small contextual example with:
+
+```bash
+python -m contextual.run_contextual \
+    --env linear_gaussian \
+    --pi0 uniform \
+    --pi1 contextual_ts \
+    --T 50 \
+    --T_offline 100 \
+    --inner_reps 500 \
+    --alpha 0.10
+```
 
 Use `find_M.py` to estimate the inner Monte Carlo size before launching large
 BSI experiments. It supports the original MAB setting, the sub-Gaussian Beta
