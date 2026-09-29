@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 
-from .contextual_bsi import ContextualParametricBSI
+from .contextual_bsi import ContextualParametricBSI, contextual_bandit_exp_runner
+from .select_inner_reps import estimate_m_from_pilot, per_trajectory_gradients
 from .simulation import (
     collect_offline_data,
     context_sampler,
@@ -23,7 +25,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pi1", choices=["uniform", "contextual_epsilon", "contextual_ts"], default="contextual_ts")
     parser.add_argument("--T", type=int, default=50)
     parser.add_argument("--T_offline", type=int, default=100)
-    parser.add_argument("--inner_reps", type=int, default=500)
+    parser.add_argument("--inner_reps", type=int, default=None)
+    parser.add_argument(
+        "--select_M",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically select the contextual BSI inner Monte Carlo size M.",
+    )
+    parser.add_argument("--Mmax", type=int, default=10000)
+    parser.add_argument("--M_m0", type=int, default=1000)
+    parser.add_argument("--M_bootstrap_reps", type=int, default=1000)
+    parser.add_argument("--M_tau", type=float, default=0.05)
+    parser.add_argument("--M_rel_eps", type=float, default=0.05)
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--n_actions", type=int, default=3)
     parser.add_argument("--context_dim", type=int, default=2)
@@ -55,6 +68,51 @@ def to_serializable(value):
     return value
 
 
+def select_inner_reps(args, offline, true_params, adaptive_behavior: bool) -> tuple[int, dict]:
+    reward_model = make_reward_model(args, adaptive_behavior=adaptive_behavior)
+    lambda_hat, Sigma = reward_model.fit(
+        contexts=offline["contexts"],
+        actions=offline["actions"],
+        rewards=offline["rewards"],
+        behavior_probs=offline["behavior_probs"],
+    )
+    sim = contextual_bandit_exp_runner(
+        reward_model=reward_model,
+        eval_policy_builder=make_policy_builder(args, args.pi1, args.epsilon1, true_params),
+        context_sampler=context_sampler(args.context_dim, args.context_var),
+        T=args.T,
+        n_reps=args.M_m0,
+        lambda_params=lambda_hat,
+        algo_seed=args.seed + 700000 + args.rep_idx,
+        context_seed=args.seed + 800000 + args.rep_idx,
+        table_renew=True,
+    )
+    grads = per_trajectory_gradients(reward_model, sim, lambda_hat)
+    est = estimate_m_from_pilot(
+        grads,
+        Sigma,
+        B=args.M_bootstrap_reps,
+        tau=args.M_tau,
+        rel_eps=args.M_rel_eps,
+        seed=args.seed + 31 * args.T_offline + 101 * args.rep_idx,
+    )
+    m_star = int(est["m_star"])
+    m_selected = min(m_star, int(args.Mmax))
+    exceeds_budget = m_star > int(args.Mmax)
+    if exceeds_budget:
+        warnings.warn(
+            f"Selected M={m_star} exceeds Mmax={args.Mmax}; using M={m_selected}.",
+            RuntimeWarning,
+        )
+    selected = {
+        **est,
+        "Mmax": int(args.Mmax),
+        "m_selected": m_selected,
+        "m_exceeds_budget": exceeds_budget,
+    }
+    return m_selected, selected
+
+
 def main() -> None:
     args = build_parser().parse_args()
     true_params = default_params(
@@ -66,6 +124,22 @@ def main() -> None:
     )
     adaptive_behavior = args.pi0 != "uniform"
     offline = collect_offline_data(args, true_params, args.rep_idx)
+    selected_M = None
+    if args.select_M:
+        args.inner_reps, selected_M = select_inner_reps(
+            args,
+            offline,
+            true_params,
+            adaptive_behavior=adaptive_behavior,
+        )
+        print(
+            f"Selected M={args.inner_reps} "
+            f"(raw m_star={selected_M['m_star']}, Mmax={args.Mmax})",
+            flush=True,
+        )
+    elif args.inner_reps is None:
+        args.inner_reps = 500
+
     reward_model = make_reward_model(args, adaptive_behavior=adaptive_behavior)
     bsi = ContextualParametricBSI(
         reward_model=reward_model,
@@ -93,6 +167,7 @@ def main() -> None:
         "lambda_hat": result.lambda_hat,
         "gradient": result.gradient,
         "Sigma": result.Sigma,
+        "selected_M": selected_M,
     }
     if args.save_path is not None:
         args.save_path.parent.mkdir(parents=True, exist_ok=True)

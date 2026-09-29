@@ -223,7 +223,7 @@ Supported policy names:
 | Argument | Default | Description |
 |---|---:|---|
 | `--select_M` / `--no-select_M` | on | Select the BSI inner Monte Carlo size before running BSI. |
-| `--Mmax` | `200000` | Upper budget for automatically selected `M`; if the estimated `M` is larger, the run uses `Mmax` and emits a warning. |
+| `--Mmax` | `10000` | Upper budget for automatically selected `M`; if the estimated `M` is larger, the run uses `Mmax` and emits a warning. |
 | `--M_m0` | `1000` | Pilot inner rollouts used for M selection. |
 | `--M_bootstrap_reps` | `1000` | Bootstrap resamples used for M selection. |
 | `--M_tau` | `0.05` | Tail probability for the M-selection error criterion. |
@@ -296,7 +296,7 @@ python -m contextual.run_contextual \
     --pi1 contextual_ts \
     --T 50 \
     --T_offline 100 \
-    --inner_reps 500 \
+    --Mmax 10000 \
     --alpha 0.10
 ```
 

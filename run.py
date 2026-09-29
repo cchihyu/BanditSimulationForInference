@@ -108,7 +108,7 @@ def build_parser():
         default=True,
         help="Automatically select the BSI inner Monte Carlo size M before running BSI.",
     )
-    parser.add_argument("--Mmax", type=int, default=200000, help="Upper budget for automatic M selection.")
+    parser.add_argument("--Mmax", type=int, default=10000, help="Upper budget for automatic M selection.")
     parser.add_argument("--M_m0", type=int, default=1000, help="Pilot rollouts used for automatic M selection.")
     parser.add_argument("--M_bootstrap_reps", type=int, default=1000, help="Bootstrap resamples used for automatic M selection.")
     parser.add_argument("--M_tau", type=float, default=0.05, help="Tail probability used for automatic M selection.")
@@ -312,9 +312,9 @@ def summarize_intervals(intervals, centers, theta_true, theta_true_se):
 
 def finalize_args(args):
     if not hasattr(args, "select_M"):
-        args.select_M = False
+        args.select_M = True
     if not hasattr(args, "Mmax"):
-        args.Mmax = 200000
+        args.Mmax = 10000
     if not hasattr(args, "M_m0"):
         args.M_m0 = 1000
     if not hasattr(args, "M_bootstrap_reps"):

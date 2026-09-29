@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--m0", type=int, default=1000, help="Pilot inner rollouts.")
     parser.add_argument("--B", type=int, default=1000, help="Bootstrap resamples.")
-    parser.add_argument("--Mmax", type=int, default=200000, help="Upper budget for selected M.")
+    parser.add_argument("--Mmax", type=int, default=10000, help="Upper budget for selected M.")
     parser.add_argument("--tau", type=float, default=0.05)
     parser.add_argument(
         "--rel_eps",
