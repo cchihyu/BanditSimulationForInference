@@ -113,8 +113,7 @@ def select_inner_reps(args, offline, true_params, adaptive_behavior: bool) -> tu
     return m_selected, selected
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def run_contextual_config(args: argparse.Namespace) -> dict:
     true_params = default_params(
         args.env,
         args.n_actions,
@@ -180,6 +179,12 @@ def main() -> None:
     print(f"gradient norm: {np.linalg.norm(result.gradient):.6f}")
     if args.save_path is not None:
         print(f"Saved to {args.save_path}")
+    return payload
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    run_contextual_config(args)
 
 
 if __name__ == "__main__":
