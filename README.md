@@ -247,7 +247,8 @@ By default, the runner computes BSI and the OPE baselines. Use
 | `--run_weighted_t_test` | Also report an IPW-style weighted t-test interval. |
 | `--run_naive_t_test` | Also report a naive iid t-test interval on raw rewards. |
 | `--cadr_min_samples` | Minimum number of samples before CADR starts using its running variance estimate. |
-| `--n_eval_prob_mc` | Monte Carlo samples used to estimate target-policy action probabilities for stochastic policies. |
+| `--n_policy_value_mc` | Ground-truth policy-value Monte Carlo rollouts. Default: `500000`. |
+| `--n_eval_prob_mc` | Monte Carlo samples used to estimate target-policy action probabilities for stochastic policies. Default: `1000`. |
 
 ### Output, seeds, and parallelism
 
@@ -296,9 +297,17 @@ python -m contextual.run_contextual \
     --pi1 contextual_ts \
     --T 50 \
     --T_offline 100 \
+    --offline_reps 1 \
+    --lambda_star 0.15 1.00 -0.75 0.15 1.00 -0.75 0.05 -0.90 0.95 \
     --Mmax 10000 \
     --alpha 0.10
 ```
+
+For contextual runs, the default parameter scenario uses three actions,
+context dimension two, and
+`lambda_star = (0.15, 1.00, -0.75, 0.15, 1.00, -0.75, 0.05, -0.90, 0.95)`.
+Pass `--lambda_star` to make the true parameter explicit, and use
+`--offline_reps` to repeat the logged-data experiment.
 
 Use `find_M.py` to estimate the inner Monte Carlo size before launching large
 BSI experiments. It supports the original MAB setting, the sub-Gaussian Beta

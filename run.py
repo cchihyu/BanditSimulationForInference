@@ -127,9 +127,9 @@ def build_parser():
             "If omitted for env=beta, hoeffding is used."
         ),
     )
-    parser.add_argument("--n_policy_value_mc", type=int, default=10000)
+    parser.add_argument("--n_policy_value_mc", type=int, default=500000)
     parser.add_argument("--n_ts_value_mc", dest="n_policy_value_mc", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--n_eval_prob_mc", type=int, default=2000)
+    parser.add_argument("--n_eval_prob_mc", type=int, default=1000)
     parser.add_argument("--n_ts_prob_mc", dest="n_eval_prob_mc", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--algo_seed", type=int, default=2026)
     parser.add_argument("--seed", dest="algo_seed", type=int, help=argparse.SUPPRESS)
