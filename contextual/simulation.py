@@ -219,3 +219,33 @@ def collect_offline_data(args: argparse.Namespace, true_params: np.ndarray, rep_
         "behavior_probs": behavior_probs,
         "T": args.T_offline,
     }
+
+
+def collect_subgaussian_data(environment, policy_builder, sample_contexts, n, seed,
+                             retain_policy_states=False):
+    """Collect logs; optionally retain pre-observation states for CADR transport."""
+    import copy
+    streams = np.random.SeedSequence(seed).spawn(4)
+    xr, ar, rr = [np.random.default_rng(s) for s in streams[:3]]
+    policy = policy_builder(int(streams[3].generate_state(1)[0]))
+    contexts = sample_contexts(xr,n)
+    actions = np.zeros(n,dtype=int); rewards = np.zeros(n)
+    probabilities = np.zeros((n,environment.n_actions)); states = []
+    for t,x in enumerate(contexts):
+        if retain_policy_states: states.append(copy.deepcopy(policy))
+        hist = dict(contexts=contexts[:t],actions=actions[:t],rewards=rewards[:t])
+        probs = np.asarray(policy.action_probs(x,history=hist),dtype=float)
+        if not np.allclose(probs.sum(),1.) or np.any(probs <= 0):
+            raise ValueError('Logging requires strictly positive normalized probabilities')
+        a = int(ar.choice(environment.n_actions,p=probs))
+        r = environment.sample(x,a,rr)
+        actions[t],rewards[t],probabilities[t] = a,r,probs
+        if hasattr(policy,'update'): policy.update(x,a,r)
+    data = dict(contexts=contexts,actions=actions,rewards=rewards,behavior_probs=probabilities,T=n)
+    def current_probabilities(t,past_contexts):
+        if not retain_policy_states:
+            raise ValueError('Policy snapshots were not retained')
+        frozen = copy.deepcopy(states[t])
+        history = dict(contexts=contexts[:t],actions=actions[:t],rewards=rewards[:t])
+        return np.asarray([frozen.action_probs(x,history=history) for x in past_contexts])
+    return data,current_probabilities

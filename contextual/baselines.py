@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import copy
 from typing import Any
 
 import numpy as np
@@ -207,24 +208,42 @@ def weighted_t_test_interval(
     return mean_x - tcrit * se_x, mean_x + tcrit * se_x
 
 
-def _running_cadr_sigma_inv(d0: np.ndarray, min_samples: int) -> np.ndarray:
-    d0 = np.asarray(d0, dtype=np.float64)
-    sigma_inv = np.empty(d0.shape[0], dtype=np.float64)
-    running_sum = 0.0
-    running_sumsq = 0.0
+def contextual_cadr_sigmas(
+    contexts, actions, rewards, behavior_probs, target_probs,
+    current_behavior_probs, min_samples=30, variance_floor=1e-12,
+    warmup_sigma=1.0,
+):
+    """Estimate current IPW-score SDs from past observations.
 
-    for idx, value in enumerate(d0):
-        if idx >= min_samples:
-            mean_d0 = running_sum / idx
-            mean_d0sq = running_sumsq / idx
-            sigma_sq = max(mean_d0sq - mean_d0 * mean_d0, 1e-12)
-            sigma_inv[idx] = 1.0 / np.sqrt(sigma_sq)
-        else:
-            sigma_inv[idx] = 1.0
-        running_sum += value
-        running_sumsq += value * value
-
-    return sigma_inv
+    current_behavior_probs(t, past_contexts) must return (t, K) probabilities
+    from the logging policy state BEFORE observation t, without updating it.
+    This callback also controls probability Monte Carlo settings for TS.
+    The target must be a fixed contextual policy. Stored propensities alone
+    cannot reconstruct adaptive logging policies at historical contexts.
+    """
+    contexts, actions, rewards, behavior_probs = _validate_contextual_inputs(
+        contexts, actions, rewards, behavior_probs)
+    target_probs = np.asarray(target_probs, dtype=float)
+    if target_probs.shape != behavior_probs.shape:
+        raise ValueError("target_probs must have shape (n, K).")
+    if min_samples < 1 or variance_floor <= 0 or warmup_sigma <= 0:
+        raise ValueError("Warm-up length and variance scales must be positive.")
+    n = len(rewards)
+    sigmas = np.full(n, warmup_sigma, dtype=float)
+    for t in range(min_samples, n):
+        current = np.asarray(current_behavior_probs(t, contexts[:t].copy()), dtype=float)
+        if (current.shape != (t, behavior_probs.shape[1])
+                or np.any(~np.isfinite(current)) or np.any(current <= 0)
+                or not np.allclose(current.sum(axis=1), 1.0)):
+            raise ValueError("Current logging probabilities must be positive normalized (t, K) rows.")
+        rows = np.arange(t)
+        gt = current[rows, actions[:t]]
+        gs = behavior_probs[rows, actions[:t]]
+        score = target_probs[rows, actions[:t]] * rewards[:t] / gt
+        ratio = gt / gs
+        variance = np.mean(ratio * score**2) - np.mean(ratio * score)**2
+        sigmas[t] = np.sqrt(max(float(variance), variance_floor))
+    return sigmas
 
 
 def cadr_interval(
@@ -232,17 +251,27 @@ def cadr_interval(
     weights: np.ndarray,
     conf_level: float,
     min_samples: int = 30,
+    *,
+    conditional_sigmas: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    rewards = np.asarray(rewards, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.float64)
-    d0 = weights * rewards
-    sigma_inv = _running_cadr_sigma_inv(d0, min_samples=min_samples)
-    d = sigma_inv * d0
-    _, se_d = _mean_and_se(d)
-    z = norm.ppf(0.5 + conf_level / 2.0)
-    sigma_bar = float(np.mean(1.0 / sigma_inv))
-    center = float(np.mean(d0))
-    half_width = z * se_d * sigma_bar
+    """Stabilized IPW interval; requires past-measurable conditional SDs.
+
+    min_samples is retained for API compatibility; warm-up is performed by
+    contextual_cadr_sigmas, not by a running variance of historical scores.
+    """
+    if conditional_sigmas is None:
+        raise ValueError("CADR requires conditional_sigmas or current logging-policy evaluations via the wrapper.")
+    rewards = np.asarray(rewards, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    sigmas = np.asarray(conditional_sigmas, dtype=float)
+    if (rewards.ndim != 1 or not rewards.size or weights.shape != rewards.shape
+            or sigmas.shape != rewards.shape or np.any(~np.isfinite(sigmas))
+            or np.any(sigmas <= 0) or not 0 < conf_level < 1):
+        raise ValueError("Invalid scores, confidence level, or conditional standard deviations.")
+    inverse = 1.0 / sigmas
+    center = float(np.sum(inverse * weights * rewards) / inverse.sum())
+    gamma = 1.0 / inverse.mean()
+    half_width = norm.ppf(0.5 + conf_level / 2.0) * gamma / np.sqrt(rewards.size)
     return center - half_width, center + half_width
 
 
@@ -751,6 +780,43 @@ def contextual_dr_wald_interval(
     return mean_phi - z * se_phi, mean_phi + z * se_phi
 
 
+def contextual_dr_bootstrap_interval(
+    contexts, actions, rewards, weights, pi_hist, conf_level,
+    reward_model=None, bootstrap_reps=1000, bootstrap_seed=2026,
+):
+    """Normal interval using bootstrap SD (denominator B), per the appendix.
+
+    Resample complete rows including stored target probabilities and weights.
+    Refit a fresh copied reward model each time; never replay shuffled histories.
+    Failed fits raise rather than silently discarding bootstrap replicates.
+    """
+    if bootstrap_reps < 2 or not 0 < conf_level < 1:
+        raise ValueError("Need at least two bootstrap replicates and 0 < conf_level < 1.")
+    arrays = [np.asarray(x) for x in (contexts, actions, rewards, weights, pi_hist)]
+    n = len(arrays[2])
+    if n < 2 or any(len(x) != n for x in arrays):
+        raise ValueError("Need at least two aligned observations.")
+    def estimate(data):
+        model = copy.deepcopy(reward_model)
+        if model is not None and not hasattr(model, "fit"):
+            raise ValueError("Bootstrap reward models must expose fit for refitting.")
+        value = float(np.mean(contextual_dr_scores(*data, reward_model=model)))
+        if not np.isfinite(value):
+            raise ValueError("Nonfinite bootstrap DR estimate.")
+        return value
+    center = estimate(arrays)
+    rng = np.random.default_rng(bootstrap_seed)
+    estimates = np.empty(bootstrap_reps)
+    for b in range(bootstrap_reps):
+        idx = rng.integers(n, size=n)
+        try:
+            estimates[b] = estimate([x[idx] for x in arrays])
+        except Exception as exc:
+            raise RuntimeError(f"DR bootstrap replicate {b} failed; no interval returned.") from exc
+    half_width = norm.ppf(0.5 + conf_level / 2.0) * estimates.std(ddof=0)
+    return center - half_width, center + half_width
+
+
 def compute_all_contextual_intervals(
     contexts: np.ndarray,
     actions: np.ndarray,
@@ -765,6 +831,15 @@ def compute_all_contextual_intervals(
     show_cvxopt_progress: bool = False,
     include_weighted_t_test: bool = False,
     include_elfcb: bool = True,
+    dr_ci_method: str = "bootstrap",
+    dr_bootstrap_reps: int = 1000,
+    dr_bootstrap_seed: int = 2026,
+    cadr_conditional_sigmas: np.ndarray | None = None,
+    cadr_current_behavior_probs: Any = None,
+    cadr_variance_floor: float = 1e-12,
+    cadr_warmup_sigma: float = 1.0,
+    cadr_target_is_fixed: bool = True,
+    include_cadr: bool = True,
 ) -> ContextualBaselineIntervals:
     contexts, actions, rewards, behavior_probs = _validate_contextual_inputs(
         contexts, actions, rewards, behavior_probs
@@ -808,8 +883,28 @@ def compute_all_contextual_intervals(
         if include_weighted_t_test
         else None
     )
-    cadr = cadr_interval(rewards, weights, conf_level, min_samples=cadr_min_samples)
-    dr = contextual_dr_wald_interval(
+    if dr_ci_method not in {"bootstrap", "wald"}:
+        raise ValueError("dr_ci_method must be bootstrap or wald.")
+    if weight_mode != "one_step":
+        raise ValueError("DR/CADR wrapper supports one_step only; cumulative weights require sequential inference.")
+    cadr = (float("nan"), float("nan"))
+    if include_cadr:
+        if not cadr_target_is_fixed:
+            raise ValueError("CADR requires a fixed contextual target; adaptive target inference is not implemented.")
+        if cadr_conditional_sigmas is None:
+            if cadr_current_behavior_probs is None:
+                raise ValueError("Supply cadr_current_behavior_probs, cadr_conditional_sigmas, or disable CADR.")
+            cadr_conditional_sigmas = contextual_cadr_sigmas(
+                contexts, actions, rewards, behavior_probs, pi_hist,
+                cadr_current_behavior_probs, cadr_min_samples,
+                cadr_variance_floor, cadr_warmup_sigma)
+        cadr = cadr_interval(rewards, weights, conf_level,
+                             conditional_sigmas=cadr_conditional_sigmas)
+    dr_function = (contextual_dr_bootstrap_interval if dr_ci_method == "bootstrap"
+                   else contextual_dr_wald_interval)
+    dr_options = ({"bootstrap_reps": dr_bootstrap_reps, "bootstrap_seed": dr_bootstrap_seed}
+                  if dr_ci_method == "bootstrap" else {})
+    dr = dr_function(
         contexts=contexts,
         actions=actions,
         rewards=rewards,
@@ -817,6 +912,7 @@ def compute_all_contextual_intervals(
         pi_hist=pi_hist,
         conf_level=conf_level,
         reward_model=reward_model,
+        **dr_options,
     )
     return ContextualBaselineIntervals(
         elfcb=elfcb,

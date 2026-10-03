@@ -381,3 +381,12 @@ Each adaptive class produces two CI variants:
 | `naive_t_test` | Naive t-test on raw rewards |
 
 ---
+
+
+## Contextual SVI sub-Gaussian extension
+
+The contextual implementation now exposes SVI names without renaming existing files.
+See [contextual/README.md](contextual/README.md) for scaled-Bernoulli, Uniform and
+Gaussian-mixture experiments, configurable dispersion and regret corrections,
+updated baselines, and the intercept-only MAB special case. Run
+`python -m contextual.run_subgaussian --help` from this directory.

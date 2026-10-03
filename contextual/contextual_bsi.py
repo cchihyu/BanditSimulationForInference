@@ -13,7 +13,7 @@ from .environments import ContextualLinearGaussianRewardModel, ContextualLogisti
 
 
 @dataclass
-class ContextualBSIResult:
+class ContextualSVIResult:
     center: float
     center_se: float
     ci_width: dict[float, float]
@@ -25,11 +25,11 @@ class ContextualBSIResult:
     pi1_img: dict[str, np.ndarray | float | int]
 
 
-class ContextualParametricBSI:
+class ContextualParametricSVI:
     """
     Simulation-based inference for contextual bandits.
 
-    This implements the correctly specified parametric BSI extension:
+    This implements the correctly specified parametric SVI extension:
         theta_hat = f_T(lambda_hat, pi1)
         CI half-width = z / sqrt(T_offline) * sqrt(g^T Sigma g)
     where g is estimated by Monte Carlo using the score/future-return identity.
@@ -58,7 +58,7 @@ class ContextualParametricBSI:
         offline_data: dict[str, np.ndarray | int],
         alphas: list[float] | np.ndarray,
         n_reps: int = 500,
-    ) -> ContextualBSIResult:
+    ) -> ContextualSVIResult:
         contexts, actions, rewards, behavior_probs, T_offline = _unpack_offline_data(offline_data)
         lambda_hat, Sigma = self.reward_model.fit(
             contexts=contexts,
@@ -79,7 +79,7 @@ class ContextualParametricBSI:
             table_renew=True,
         )
 
-        gradient = estimate_contextual_bsi_gradient(
+        gradient = estimate_contextual_svi_gradient(
             reward_model=self.reward_model,
             sim_result=pi1_img,
             lambda_params=lambda_hat,
@@ -95,7 +95,7 @@ class ContextualParametricBSI:
             float(alpha): float(np.sqrt(chi2.ppf(1.0 - float(alpha), df=lambda_hat.shape[0])) * se / np.sqrt(T_offline))
             for alpha in alphas
         }
-        return ContextualBSIResult(
+        return ContextualSVIResult(
             center=center,
             center_se=center_se,
             ci_width=ci_width,
@@ -134,7 +134,7 @@ def contextual_bandit_exp_runner(
         and probe_policy.include_intercept
     )
     can_vectorize_ts = (
-        os.environ.get("CONTEXTUAL_BSI_DISABLE_TS_VECTORIZE", "").lower() not in {"1", "true", "yes"}
+        os.environ.get("CONTEXTUAL_SVI_DISABLE_TS_VECTORIZE", os.environ.get("CONTEXTUAL_BSI_DISABLE_TS_VECTORIZE", "")).lower() not in {"1", "true", "yes"}
         and (is_linear or is_logistic)
         and reward_model.feature_map is None
         and not (is_linear and reward_model.sigma is None)
@@ -289,8 +289,8 @@ def contextual_bandit_exp_runner(
                     selected_x = x_step
                     precision[np.arange(n_reps), actions] += (
                         selected_x[:, :, None] * selected_x[:, None, :]
-                    ) / (sigma**2)
-                    info[np.arange(n_reps), actions] += selected_x * rewards[:, None] / (sigma**2)
+                    ) / (probe_policy.obs_sigma**2)
+                    info[np.arange(n_reps), actions] += selected_x * rewards[:, None] / (probe_policy.obs_sigma**2)
                 else:
                     reward_probs = expit(np.clip(reward_means, -35.0, 35.0))
                     rewards = reward_rng.binomial(1, reward_probs, size=n_reps).astype(np.float64)
@@ -506,7 +506,7 @@ def contextual_bandit_exp_runner(
         contexts = first_contexts if rep == 0 and not table_renew else _as_2d_contexts(context_sampler(ctx_rng, T))
         if contexts.shape != (T, context_dim):
             raise ValueError(f"context_sampler must return shape {(T, context_dim)} every time.")
-        policy = eval_policy_builder(algo_seed + rep)
+        policy = eval_policy_builder(algo_seed + rep + 1_000_003)
         action_rng = np.random.default_rng(algo_seed + rep)
         reward_rng = np.random.default_rng(context_seed + 100000 + rep)
         probs_rep = []
@@ -553,7 +553,7 @@ def contextual_bandit_exp_runner(
     }
 
 
-def estimate_contextual_bsi_gradient(
+def estimate_contextual_svi_gradient(
     reward_model: Any,
     sim_result: dict[str, np.ndarray | float | int],
     lambda_params: np.ndarray,
@@ -865,3 +865,8 @@ def _maybe_update_policy(policy: Any, context: np.ndarray, action: int, reward: 
         policy.update(context, action, reward)
     except TypeError:
         policy.update(action, reward)
+
+# Compatibility aliases; filenames remain unchanged.
+ContextualBSIResult = ContextualSVIResult
+ContextualParametricBSI = ContextualParametricSVI
+estimate_contextual_bsi_gradient = estimate_contextual_svi_gradient

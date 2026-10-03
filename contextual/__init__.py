@@ -1,1 +1,2 @@
-"""Contextual BSI simulation and inference package."""
+"""Contextual SVI simulation and inference package."""
+from .contextual_bsi import ContextualParametricSVI, ContextualSVIResult

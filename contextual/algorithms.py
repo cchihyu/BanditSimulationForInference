@@ -26,8 +26,8 @@ class ContextualEpsilonGreedyPolicy:
     ):
         if n_actions <= 0:
             raise ValueError("n_actions must be positive.")
-        if context_dim <= 0:
-            raise ValueError("context_dim must be positive.")
+        if context_dim < 0:
+            raise ValueError("context_dim must be nonnegative.")
         if not 0.0 <= epsilon <= 1.0:
             raise ValueError("epsilon must lie in [0, 1].")
         if reward_type not in {"linear_gaussian", "logistic_bernoulli"}:
@@ -132,6 +132,8 @@ class ContextualTSPolicy:
         tol: float = 1e-8,
         seed: int | None = None,
     ):
+        if n_actions <= 0 or context_dim < 0 or (context_dim == 0 and not include_intercept):
+            raise ValueError("Need positive actions and at least one feature including the intercept.")
         if reward_type not in {"linear_gaussian", "logistic_bernoulli"}:
             raise ValueError("reward_type must be 'linear_gaussian' or 'logistic_bernoulli'.")
         if obs_sigma <= 0.0:

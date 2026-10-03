@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .contextual_bsi import ContextualParametricBSI, contextual_bandit_exp_runner
+from .contextual_bsi import ContextualParametricSVI, contextual_bandit_exp_runner
 from .select_inner_reps import estimate_m_from_pilot, per_trajectory_gradients
 from .simulation import (
     collect_offline_data,
@@ -20,7 +20,7 @@ from .simulation import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run one small contextual BSI experiment.")
+    parser = argparse.ArgumentParser(description="Run one small contextual SVI experiment.")
     parser.add_argument("--env", choices=["linear_gaussian", "logistic_bernoulli"], default="linear_gaussian")
     parser.add_argument("--pi0", choices=["uniform", "contextual_epsilon", "contextual_ts"], default="uniform")
     parser.add_argument("--pi1", choices=["uniform", "contextual_epsilon", "contextual_ts"], default="contextual_ts")
@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--select_M",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Automatically select the contextual BSI inner Monte Carlo size M.",
+        help="Automatically select the contextual SVI inner Monte Carlo size M.",
     )
     parser.add_argument("--Mmax", type=int, default=10000)
     parser.add_argument("--M_m0", type=int, default=1000)
@@ -172,7 +172,7 @@ def run_one_contextual_config(
         args.inner_reps = 500
 
     reward_model = make_reward_model(args, adaptive_behavior=adaptive_behavior)
-    bsi = ContextualParametricBSI(
+    svi = ContextualParametricSVI(
         reward_model=reward_model,
         eval_policy_builder=make_policy_builder(args, args.pi1, args.epsilon1, true_params),
         context_sampler=context_sampler(args.context_dim, args.context_var),
@@ -180,7 +180,7 @@ def run_one_contextual_config(
         algo_seed=args.seed + 700000 + args.rep_idx,
         context_seed=args.seed + 800000 + args.rep_idx,
     )
-    result = bsi.run(offline, alphas=[args.alpha], n_reps=args.inner_reps)
+    result = svi.run(offline, alphas=[args.alpha], n_reps=args.inner_reps)
     lower = result.center - result.ci_width[args.alpha]
     upper = result.center + result.ci_width[args.alpha]
     proj_lower = result.center - result.proj_ci_width[args.alpha]
@@ -260,9 +260,9 @@ def run_contextual_config(args: argparse.Namespace) -> dict:
     if n_reps == 1:
         print(f"lambda_star: {np.asarray(true_params).reshape(args.n_actions, args.context_dim + 1)}")
         print(f"theta_hat: {payload['center']:.6f}")
-        print(f"{100 * (1 - args.alpha):.0f}% BSI CI: ({payload['ci'][0]:.6f}, {payload['ci'][1]:.6f})")
+        print(f"{100 * (1 - args.alpha):.0f}% SVI CI: ({payload['ci'][0]:.6f}, {payload['ci'][1]:.6f})")
         print(
-            f"{100 * (1 - args.alpha):.0f}% BSI-Projection CI: "
+            f"{100 * (1 - args.alpha):.0f}% SVI-Projection CI: "
             f"({payload['proj_ci'][0]:.6f}, {payload['proj_ci'][1]:.6f})"
         )
         print(f"gradient norm: {np.linalg.norm(payload['gradient']):.6f}")

@@ -31,7 +31,7 @@ def parse_int_list(text: str) -> list[int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Estimate the inner Monte Carlo size M needed for stable contextual BSI widths."
+        description="Estimate the inner Monte Carlo size M needed for stable contextual SVI widths."
     )
     parser.add_argument("--envs", default="linear_gaussian,logistic_bernoulli")
     parser.add_argument("--pairs", default="uni_ts,ts_ts,eps_eps")
@@ -85,32 +85,17 @@ def make_run_args(args: argparse.Namespace, env: str, pi0: str, pi1: str, toff: 
 
 
 def per_trajectory_gradients(reward_model, sim_result: dict, lambda_hat: np.ndarray) -> np.ndarray:
-    contexts = np.asarray(sim_result["all_contexts"], dtype=np.float64)
-    actions = np.asarray(sim_result["all_actions"], dtype=np.int64)
-    rewards = np.asarray(sim_result["all_rewards"], dtype=np.float64)
-    n_reps, T = actions.shape
-    n_actions = reward_model.n_actions
-    p = contexts.shape[2] + 1
-    beta = np.asarray(lambda_hat, dtype=np.float64).reshape(n_actions, p)
-    x_design = np.concatenate(
-        [np.ones((*contexts.shape[:2], 1), dtype=np.float64), contexts],
-        axis=2,
-    )
-    future_returns = np.cumsum(rewards[:, ::-1], axis=1)[:, ::-1]
-    grads = np.zeros((n_reps, n_actions * p), dtype=np.float64)
-
-    if reward_model.__class__.__name__ == "ContextualLinearGaussianRewardModel":
-        means = np.einsum("mtp,mtp->mt", x_design, beta[actions])
-        scale = (rewards - means) * future_returns / (T * float(reward_model.sigma) ** 2)
-    else:
-        logits = np.einsum("mtp,mtp->mt", x_design, beta[actions])
-        probs = expit(np.clip(logits, -35.0, 35.0))
-        scale = (rewards - probs) * future_returns / T
-
-    for action in range(n_actions):
-        mask = actions == action
-        contrib = x_design * (scale * mask)[:, :, None]
-        grads[:, action * p : (action + 1) * p] = contrib.sum(axis=1)
+    contexts = np.asarray(sim_result["all_contexts"])
+    actions = np.asarray(sim_result["all_actions"])
+    rewards = np.asarray(sim_result["all_rewards"])
+    n_reps, horizon = actions.shape
+    future = np.cumsum(rewards[:, ::-1], axis=1)[:, ::-1]
+    grads = np.zeros((n_reps, len(lambda_hat)))
+    for rep in range(n_reps):
+        for step in range(horizon):
+            grads[rep] += reward_model.score(
+                contexts[rep, step], int(actions[rep, step]),
+                rewards[rep, step], params=lambda_hat) * future[rep, step] / horizon
     return grads
 
 
