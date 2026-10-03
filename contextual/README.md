@@ -182,9 +182,20 @@ Validate both the statistical extensions and performance paths with:
 python -m unittest discover -s tests -p 'test_contextual_*.py' -v
 ```
 
-Truth simulation uses `--truth_batch_size 1000` by default. With five horizons and
-50,000 truth trajectories each, 250 tasks share the same worker pool, so
-`--n_jobs 64` can use 64 workers in this stage too. The progress bar counts completed
-batches. A final shorter batch is included. Trajectory seeds and aggregate means
-and standard errors are unchanged by batch size or worker count. There are no
-nested process pools. Truth computations still restart on a new invocation.
+Truth simulation uses `--truth_batch_size 1000` by default. Each trajectory runs
+once to the largest requested horizon and records values at every earlier horizon.
+With 50,000 truth trajectories, 50 batches share the worker pool. To keep all 64
+workers occupied, use `--truth_batch_size 500` (100 batches). The progress bar counts
+completed multi-horizon batches. A final shorter batch is included. Trajectory seeds
+and aggregate means and standard errors are unchanged by batch size or worker count.
+There are no nested process pools. Truth computations still restart on a new invocation.
+
+Gaussian-mixture screening and refinement also reuse each candidate trajectory across
+all requested horizons. Candidate selection is still performed separately at every
+horizon, and the union of selected candidates is refined once to the maximum horizon.
+
+Use `--truth_cache_path results/scaled_bernoulli_ts_truth.json` in sequential runs
+with different logging policies. The first run writes the truth estimates; later runs
+reuse them after validating every truth-relevant environment, target-policy, horizon,
+simulation-budget, seed, and backend setting. A mismatch raises instead of silently
+using incompatible values.

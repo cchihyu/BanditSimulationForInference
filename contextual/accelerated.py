@@ -68,9 +68,10 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                   mix_weights, mix_means, mix_sds, env_code, logistic,
                   variance_code, floor, joint, policy_code, epsilon, prior_mean,
                   prior_var, obs_var, n_mc, pi_clip, explore_untried,
-                  benchmark_epsilon, probability_floor, gradient_size):
+                  checkpoints, benchmark_epsilon, probability_floor, gradient_size):
     batch,horizon,d=contexts.shape; k,p=beta.shape
-    observed=np.zeros(batch); expected=np.zeros(batch); regrets=np.zeros(batch)
+    n_checkpoints=len(checkpoints)
+    observed=np.zeros((batch,n_checkpoints)); expected=np.zeros((batch,n_checkpoints)); regrets=np.zeros((batch,n_checkpoints))
     gradients=np.zeros((batch,gradient_size))
     for rep in range(batch):
         np.random.seed(seeds[rep])
@@ -78,6 +79,7 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
         cov=np.zeros((k,p,p)); gram=np.zeros((k,p,p)); info=np.zeros((k,p)); counts=np.zeros(k)
         for a in range(k): cov[a]=np.eye(p)*prior_var
         cumulative_score=np.zeros(gradient_size)
+        observed_sum=0.; expected_sum=0.; regret_sum=0.; checkpoint_index=0
         x=np.ones(p)
         for t in range(horizon):
             x[1:]=contexts[rep,t]
@@ -100,9 +102,9 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
             if logistic:
                 for a in range(k):means[a]=scales[a]*sigmoid(means[a])
             policy_value=probs@means
-            expected[rep]+=policy_value/horizon
+            expected_sum+=policy_value
             oracle=(1.-benchmark_epsilon)*np.max(means)+benchmark_epsilon*np.mean(means)
-            regrets[rep]+=oracle-policy_value
+            regret_sum+=oracle-policy_value
             a=choose(probs);mu=means[a]
             v=variances[a]
             if logistic:
@@ -120,7 +122,7 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                 noise=mix_means[a,component]+mix_sds[a,component]*np.random.normal()
                 reward=mu+(np.sqrt(v)*noise if env_code==4 else noise)
             else:reward=mu+np.sqrt(v)*np.random.normal()
-            observed[rep]+=reward/horizon
+            observed_sum+=reward
             if gradient_size>0:
                 residual=reward-mu
                 dm=1.
@@ -141,6 +143,11 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                 gram[a]+=np.outer(x,x);info[a]+=x*reward;counts[a]+=1.
                 try:policy_means[a]=np.linalg.solve(gram[a],info[a])
                 except Exception:policy_means[a]=np.linalg.pinv(gram[a])@info[a]
+            if checkpoint_index<n_checkpoints and t+1==checkpoints[checkpoint_index]:
+                observed[rep,checkpoint_index]=observed_sum/(t+1)
+                expected[rep,checkpoint_index]=expected_sum/(t+1)
+                regrets[rep,checkpoint_index]=regret_sum
+                checkpoint_index+=1
     return observed,expected,regrets,gradients
 
 
@@ -223,6 +230,40 @@ def simulate(environment, policy_builder, sampler, horizon, reps, seed,
             contexts.append(sampler(xr,horizon))
             seeds.append(streams[1].generate_state(1)[0])
         result=rollout_block(np.ascontiguousarray(contexts,dtype=float),np.array(seeds,dtype=np.uint32),
-                            *packed,float(benchmark_epsilon),1e-12 if gradient else 0.,size)
-        observed[start:end],expected[start:end],regrets[start:end],grads[start:end]=result
+                            *packed,np.array([horizon],dtype=np.int64),float(benchmark_epsilon),
+                            1e-12 if gradient else 0.,size)
+        observed[start:end],expected[start:end],regrets[start:end],grads[start:end]=result[0][:,0],result[1][:,0],result[2][:,0],result[3]
     return dict(observed=observed,expected=expected,regrets=regrets,trajectory_gradients=grads,backend='numba')
+
+
+def simulate_horizons(environment, policy_builder, sampler, horizons, reps, seed,
+                      benchmark_epsilon=0., backend='auto', block_size=128,
+                      progress=False, description='Rollouts', trajectory_offset=0):
+    """Simulate to max(horizons) once and return every requested checkpoint."""
+    checkpoints=np.array(sorted(set(int(h) for h in horizons)),dtype=np.int64)
+    if checkpoints.size==0 or checkpoints[0]<1:raise ValueError('Horizons must be positive')
+    if backend not in {'auto','python','numba'}:raise ValueError('Unknown backend')
+    if backend=='python':return None
+    if not NUMBA_AVAILABLE:
+        if backend=='numba':raise ImportError('Install numba to use --backend numba')
+        return None
+    packed=pack(environment,policy_builder(seed))
+    if packed is None:
+        if backend=='numba':raise ValueError('Numba backend does not support this custom model/policy')
+        return None
+    if reps<1 or block_size<1 or trajectory_offset<0:raise ValueError('Invalid rollout sizes')
+    observed=np.empty((reps,len(checkpoints)));expected=np.empty_like(observed);regrets=np.empty_like(observed)
+    starts=range(0,reps,block_size)
+    if progress:
+        from tqdm.auto import tqdm
+        starts=tqdm(starts,total=(reps+block_size-1)//block_size,desc=description,unit='block',leave=False)
+    for start in starts:
+        end=min(reps,start+block_size);contexts=[];seeds=[]
+        for rep in range(start+trajectory_offset,end+trajectory_offset):
+            streams=np.random.SeedSequence([int(seed),rep]).spawn(2)
+            contexts.append(sampler(np.random.default_rng(streams[0]),int(checkpoints[-1])))
+            seeds.append(streams[1].generate_state(1)[0])
+        result=rollout_block(np.ascontiguousarray(contexts,dtype=float),np.array(seeds,dtype=np.uint32),
+                             *packed,checkpoints,float(benchmark_epsilon),0.,0)
+        observed[start:end],expected[start:end],regrets[start:end]=result[:3]
+    return dict(horizons=checkpoints,observed=observed,expected=expected,regrets=regrets,backend='numba')

@@ -1,6 +1,7 @@
 """Run contextual SVI sub-Gaussian coverage studies (MAB: --context_dim 0)."""
 from __future__ import annotations
 import argparse
+import hashlib
 import os
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -14,7 +15,7 @@ from .subgaussian_environments import SubGaussianEnvironment
 from .environments import ContextualSubGaussianWorkingModel
 from .contextual_bsi import ContextualParametricSVI, contextual_bandit_exp_runner, simulate_svi_summary
 from .select_inner_reps import per_trajectory_gradients, estimate_m_from_pilot
-from .regret_corrections import search_mixture_regret, minimax_type_regret, regret_rollouts, expand_interval
+from .regret_corrections import search_mixture_regret_horizons, minimax_type_regret, regret_rollouts_horizons, expand_interval
 from .run_contextual import to_serializable
 from .baselines import compute_all_contextual_intervals, PerActionLinearRewardModel, PerActionLogisticRewardModel
 
@@ -82,6 +83,7 @@ def build_parser():
     p.add_argument('--cadr_warmup_sigma',type=float,default=1.)
     p.add_argument('--save_path',type=Path,default=Path('results/contextual_svi.json'))
     p.add_argument('--truth_batch_size', type=int, default=1000, help='Truth trajectories per worker task')
+    p.add_argument('--truth_cache_path', type=Path, help='Validated truth-value cache reusable across logging policies')
     p.add_argument('--n_jobs', type=int, default=1, help='Offline dataset workers; -1 uses available CPUs')
     p.add_argument('--backend', choices=['auto','numba','python'], default='auto')
     p.add_argument('--rollout_block_size', type=int, default=128)
@@ -133,6 +135,7 @@ def _replication_task(task):
             scales=env.scales,support_widths=None if args.env == 'gaussian_mixture' else env.support_widths(),
             adaptive_behavior=args.pi0 != 'uniform',propagate_variance_uncertainty=args.propagate_variance_uncertainty,
             variance_floor=args.variance_floor,proxy_alpha=args.proxy_alpha,proxy_grid_size=args.proxy_grid_size)
+        fitted={}
         for T in args.T_values:
             svi = ContextualParametricSVI(model,target,sampler,T,algo_seed=seed+100,context_seed=seed+200)
             M=args.inner_reps; m_info=None
@@ -147,11 +150,18 @@ def _replication_task(task):
             wald=[result.center-result.ci_width[args.alpha],result.center+result.ci_width[args.alpha]]
             proj=[result.center-result.proj_ci_width[args.alpha],result.center+result.proj_ci_width[args.alpha]]
             primary=wald if args.pi0 == 'uniform' else proj
+            fitted[T]=(result,M,m_info,wald,proj,primary)
+        mixture_by_T={}
+        if 'gaussian_mixture_search' in args.regret_methods:
+            mixture_by_T=search_mixture_regret_horizons(model,target,sampler,args.T_values,
+                args.candidate_count,args.mixture_components,args.screen_rollouts,args.refine_rollouts,
+                args.n_refine,args.regret_benchmark,args.benchmark_epsilon,seed+600,
+                args.mc_error_probability,backend=args.backend,block_size=args.rollout_block_size,
+                progress=args.progress and args.n_jobs==1)
+        for T in args.T_values:
+            result,M,m_info,wald,proj,primary=fitted[T]
             for correction in args.regret_methods:
-                if correction == 'gaussian_mixture_search':
-                    reg=search_mixture_regret(model,target,sampler,T,args.candidate_count,args.mixture_components,
-                        args.screen_rollouts,args.refine_rollouts,args.n_refine,args.regret_benchmark,
-                        args.benchmark_epsilon,seed+600,args.mc_error_probability,backend=args.backend,block_size=args.rollout_block_size,progress=args.progress and args.n_jobs==1)
+                if correction == 'gaussian_mixture_search':reg=mixture_by_T[T]
                 else:
                     proxy=max(env.scales**2/4) if args.env == 'scaled_bernoulli' else max(model.variances)
                     reg=minimax_type_regret(T,args.n_actions,model.p,proxy,args.bound_constant,args.bound_formula,args.bound_log)
@@ -176,14 +186,14 @@ def _safe_replication_task(task):
 
 
 def _truth_task(task):
-    args,beta,T,start,count=task
+    args,beta,start,count=task
     env = SubGaussianEnvironment(args.env,beta,args.scales,args.half_widths,
                                  None if args.mixtures_json is None else json.loads(args.mixtures_json))
     sampler = context_sampler(args.context_dim,args.context_var)
     behavior = policy_builder(args,args.pi0,args.epsilon0)
     target = policy_builder(args,args.pi1,args.epsilon1)
-    return T,start,regret_rollouts(env,target,sampler,T,count,seed=args.seed+900000+T,
-                            backend=args.backend,block_size=args.rollout_block_size,
+    return start,regret_rollouts_horizons(env,target,sampler,args.T_values,count,
+                            seed=args.seed+900000,backend=args.backend,block_size=args.rollout_block_size,
                             progress=False,trajectory_offset=start,return_samples=True)
 
 
@@ -235,25 +245,40 @@ def run(args):
         if not NUMBA_AVAILABLE: raise ImportError('Install numba to select the numba backend')
     if args.truth_batch_size < 1:
         raise ValueError('truth_batch_size must be positive')
-    # Fixed trajectory indices preserve seeds across task sizes and worker schedules.
-    truth_tasks=[(args,beta,T,start,min(args.truth_batch_size,args.truth_reps-start))
-                 for start in range(0,args.truth_reps,args.truth_batch_size)
-                 for T in args.T_values]
-    samples={T:dict(values=np.empty(args.truth_reps),regrets=np.empty(args.truth_reps))
-             for T in args.T_values}
-    backends={}
-    for T,start,result in _map_tasks(_truth_task,truth_tasks,args,'True policy batches'):
-        count=len(result['values'])
-        for key in ['values','regrets']:
-            samples[T][key][start:start+count]=result[key]
-        backends[T]=result['backend']
-    truth={}
-    for T,data in samples.items():
-        values,regrets=data['values'],data['regrets']
-        truth[T]=dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(args.truth_reps)),
-                      regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(args.truth_reps)))
-        if backends[T]=='numba': truth[T]['backend']='numba'
-    del samples
+    truth_spec=dict(env=args.env,beta=beta.tolist(),scales=np.asarray(env.scales).tolist(),
+        half_widths=np.asarray(env.half_widths).tolist(),mixtures=args.mixtures_json,
+        context_dim=args.context_dim,context_var=args.context_var,pi1=args.pi1,
+        epsilon1=args.epsilon1,obs_sigma=args.obs_sigma,ts_prob_mc=args.ts_prob_mc,
+        horizons=sorted(set(args.T_values)),truth_reps=args.truth_reps,seed=args.seed,
+        backend=args.backend)
+    fingerprint=hashlib.sha256(json.dumps(truth_spec,sort_keys=True).encode()).hexdigest()
+    truth=None
+    if args.truth_cache_path is not None and args.truth_cache_path.exists():
+        cached=json.loads(args.truth_cache_path.read_text())
+        if cached.get('fingerprint')!=fingerprint:
+            raise ValueError(f'Truth cache does not match this experiment: {args.truth_cache_path}')
+        truth={int(T):value for T,value in cached['truth'].items()}
+    if truth is None:
+        # Fixed trajectory indices preserve seeds across task sizes and worker schedules.
+        truth_tasks=[(args,beta,start,min(args.truth_batch_size,args.truth_reps-start))
+                     for start in range(0,args.truth_reps,args.truth_batch_size)]
+        samples={T:dict(values=np.empty(args.truth_reps),regrets=np.empty(args.truth_reps))
+                 for T in args.T_values};backends={}
+        for start,result in _map_tasks(_truth_task,truth_tasks,args,'True multi-horizon batches'):
+            count=len(result['values'])
+            for j,T in enumerate(result['horizons']):
+                for key in ['values','regrets']:
+                    samples[T][key][start:start+count]=result[key][:,j]
+                backends[T]=result['backend']
+        truth={}
+        for T,data in samples.items():
+            values,regrets=data['values'],data['regrets']
+            truth[T]=dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(args.truth_reps)),
+                          regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(args.truth_reps)))
+            if backends[T]=='numba':truth[T]['backend']='numba'
+        if args.truth_cache_path is not None:
+            args.truth_cache_path.parent.mkdir(parents=True,exist_ok=True)
+            args.truth_cache_path.write_text(json.dumps(dict(fingerprint=fingerprint,spec=truth_spec,truth=truth),indent=2))
 
     records=[];baseline_records=[];failures=[]
     args.save_path.parent.mkdir(parents=True,exist_ok=True)

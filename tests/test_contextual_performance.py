@@ -9,7 +9,7 @@ from contextual.algorithms import ContextualTSPolicy, ContextualEpsilonGreedyPol
 from contextual.simulation import UniformContextualPolicy, context_sampler, collect_subgaussian_data
 from contextual.subgaussian_environments import SubGaussianEnvironment
 from contextual.environments import ContextualSubGaussianWorkingModel
-from contextual.regret_corrections import regret_rollouts, MixtureCandidate, standardized_mixture
+from contextual.regret_corrections import regret_rollouts, regret_rollouts_horizons, MixtureCandidate, standardized_mixture
 from contextual.run_subgaussian import build_parser,run
 
 
@@ -106,6 +106,17 @@ class CompiledTests(unittest.TestCase):
                 self.assertEqual(float(values.mean()),full[out])
                 self.assertEqual(float(values.std(ddof=1)/np.sqrt(7)),full[out+'_se'])
 
+    def test_multi_horizon_matches_prefix_rollouts(self):
+        env=SubGaussianEnvironment('uniform',np.array([[.1,.2],[-.2,.3]]))
+        target=lambda seed:ContextualTSPolicy(2,1,n_prob_mc=10,seed=seed)
+        shared=regret_rollouts_horizons(env,target,context_sampler(1),[2,4],7,
+                                       seed=31,backend='numba',return_samples=True)
+        for j,T in enumerate([2,4]):
+            separate=regret_rollouts(env,target,context_sampler(1),T,7,seed=31,
+                                     backend='numba',return_samples=True)
+            np.testing.assert_array_equal(shared['values'][:,j],separate['values'])
+            np.testing.assert_array_equal(shared['regrets'][:,j],separate['regrets'])
+
     def test_failure_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             args=build_parser().parse_args(['--env','scaled_bernoulli','--n_actions','2','--context_dim','0',
@@ -116,5 +127,19 @@ class CompiledTests(unittest.TestCase):
             self.assertEqual(len(result['failures']),2)
             self.assertEqual(result['summary'][0]['failed_reps'],2)
             self.assertEqual(json.loads(args.save_path.read_text())['summary'][0]['coverage'],None)
+
+    def test_truth_cache_reused_and_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache=Path(tmp)/'truth.json'
+            common=['--env','uniform','--n_actions','2','--context_dim','0','--T_values','2','4',
+                    '--T_offline_values','20','--offline_reps','1','--inner_reps','3','--truth_reps','4',
+                    '--regret_methods','minimax_bound','--backend','numba','--no-progress',
+                    '--truth_cache_path',str(cache)]
+            first=build_parser().parse_args(common+['--pi0','uniform','--save_path',str(Path(tmp)/'a.json')])
+            second=build_parser().parse_args(common+['--pi0','contextual_epsilon','--save_path',str(Path(tmp)/'b.json')])
+            one=run(first);two=run(second)
+            self.assertEqual(one['truth'],two['truth']);self.assertTrue(cache.exists())
+            mismatch=build_parser().parse_args(common+['--seed','999','--save_path',str(Path(tmp)/'c.json')])
+            with self.assertRaisesRegex(ValueError,'does not match'):run(mismatch)
 
 if __name__=='__main__':unittest.main()
