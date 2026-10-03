@@ -31,18 +31,20 @@ class MixtureCandidate:
 
 def regret_rollouts(environment, policy_builder, context_sampler, horizon, reps,
                     benchmark='unrestricted', epsilon=0., seed=2026, *,
-                    backend='python', block_size=128, progress=False):
+                    backend='python', block_size=128, progress=False, trajectory_offset=0,
+                    return_samples=False):
     if benchmark not in {'unrestricted','epsilon_floor'} or not 0 <= epsilon <= 1:
         raise ValueError('Invalid benchmark')
-    if horizon < 1 or reps < 2:
+    if horizon < 1 or reps < (1 if return_samples else 2) or trajectory_offset < 0:
         raise ValueError('Positive horizon and >=2 rollouts required')
     from .accelerated import simulate
     fast=simulate(environment,policy_builder,context_sampler,horizon,reps,seed,
                   benchmark_epsilon=epsilon if benchmark=='epsilon_floor' else 0.,
                   backend=backend,block_size=block_size,progress=progress,
-                  description='Policy value / regret')
+                  description='Policy value / regret',trajectory_offset=trajectory_offset)
     if fast is not None:
         values=fast['expected']; regrets=fast['regrets']
+        if return_samples: return dict(values=values,regrets=regrets,backend='numba')
         return dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(reps)),
                     regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(reps)),backend='numba')
     values = np.zeros(reps); regrets = np.zeros(reps)
@@ -51,7 +53,7 @@ def regret_rollouts(environment, policy_builder, context_sampler, horizon, reps,
         from tqdm.auto import tqdm
         repetitions=tqdm(repetitions,desc='Python policy rollouts',leave=False)
     for rep in repetitions:
-        seeds = np.random.SeedSequence([seed,rep]).spawn(4)
+        seeds = np.random.SeedSequence([seed,rep+trajectory_offset]).spawn(4)
         xr,ar,rr = [np.random.default_rng(s) for s in seeds[:3]]
         policy = policy_builder(int(seeds[3].generate_state(1)[0]))
         xs = context_sampler(xr,horizon)
@@ -72,6 +74,7 @@ def regret_rollouts(environment, policy_builder, context_sampler, horizon, reps,
             values[rep] += expected/horizon
             aa[t] = ar.choice(k,p=probs); yy[t] = environment.sample(x,aa[t],rr)
             if hasattr(policy,'update'): policy.update(x,int(aa[t]),float(yy[t]))
+    if return_samples: return dict(values=values,regrets=regrets,backend='python')
     return dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(reps)),
                 regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(reps)))
 

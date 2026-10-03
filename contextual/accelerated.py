@@ -196,7 +196,7 @@ def pack(environment, policy, params=None):
 
 def simulate(environment, policy_builder, sampler, horizon, reps, seed,
              params=None, gradient=False, benchmark_epsilon=0., backend='auto',
-             block_size=128, progress=False, description='Rollouts', context_seed=None):
+             block_size=128, progress=False, description='Rollouts', context_seed=None, trajectory_offset=0):
     """Streaming rollouts: retain per-trajectory summaries, not full histories."""
     if backend not in {'auto','python','numba'}:raise ValueError('Unknown backend')
     if backend=='python':return None
@@ -207,7 +207,7 @@ def simulate(environment, policy_builder, sampler, horizon, reps, seed,
     if packed is None:
         if backend=='numba':raise ValueError('Numba backend does not support this custom model/policy')
         return None
-    if horizon<1 or reps<2 or block_size<1:raise ValueError('Invalid rollout sizes')
+    if horizon<1 or reps<1 or block_size<1 or trajectory_offset<0:raise ValueError('Invalid rollout sizes')
     size=len(params if params is not None else environment.lambda_hat_) if gradient else 0
     observed=np.empty(reps);expected=np.empty(reps);regrets=np.empty(reps);grads=np.empty((reps,size))
     starts=range(0,reps,block_size)
@@ -217,7 +217,7 @@ def simulate(environment, policy_builder, sampler, horizon, reps, seed,
     for start in starts:
         end=min(reps,start+block_size)
         contexts=[];seeds=[]
-        for rep in range(start,end):
+        for rep in range(start+trajectory_offset,end+trajectory_offset):
             streams=np.random.SeedSequence([int(seed),rep]).spawn(2)
             xr=np.random.default_rng(streams[0] if context_seed is None else np.random.SeedSequence([int(context_seed),rep]))
             contexts.append(sampler(xr,horizon))

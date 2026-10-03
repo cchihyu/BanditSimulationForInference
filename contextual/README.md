@@ -151,7 +151,7 @@ allocation. `--n_jobs -1` uses CPUs visible to the process; it may exceed a sche
 allocation without CPU affinity restrictions. Default worker count is one.
 
 Progress bars are enabled by default (`--no-progress` disables them). Multiple
-workers parallelize independent offline datasets and truth estimates by horizon;
+workers parallelize independent offline datasets and truth trajectories in batches;
 worker BLAS threads are limited to one to avoid oversubscription. Install the
 updated environment or run `python -m pip install numba tqdm threadpoolctl`.
 
@@ -181,3 +181,10 @@ Validate both the statistical extensions and performance paths with:
 ```bash
 python -m unittest discover -s tests -p 'test_contextual_*.py' -v
 ```
+
+Truth simulation uses `--truth_batch_size 1000` by default. With five horizons and
+50,000 truth trajectories each, 250 tasks share the same worker pool, so
+`--n_jobs 64` can use 64 workers in this stage too. The progress bar counts completed
+batches. A final shorter batch is included. Trajectory seeds and aggregate means
+and standard errors are unchanged by batch size or worker count. There are no
+nested process pools. Truth computations still restart on a new invocation.

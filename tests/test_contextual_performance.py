@@ -83,7 +83,7 @@ class CompiledTests(unittest.TestCase):
                     '--T_offline_values','80','--offline_reps','3','--inner_reps','4','--truth_reps','4',
                     '--candidate_count','2','--screen_rollouts','3','--refine_rollouts','3',
                     '--regret_methods','gaussian_mixture_search','minimax_bound','--backend','numba',
-                    '--n_jobs',str(jobs),'--no-progress','--save_path',str(Path(tmp)/f'j{jobs}.json')])
+                    '--truth_batch_size','1' if jobs==2 else '3','--n_jobs',str(jobs),'--no-progress','--save_path',str(Path(tmp)/f'j{jobs}.json')])
             one=run(args(1));two=run(args(2))
             self.assertEqual(one['truth'],two['truth'])
             self.assertEqual(one['summary'],two['summary'])
@@ -92,6 +92,19 @@ class CompiledTests(unittest.TestCase):
                 self.assertEqual(a['corrected'],b['corrected'])
                 self.assertEqual(a['regret'],b['regret'])
             self.assertEqual(len(Path(two['checkpoint']).read_text().splitlines()),4)
+
+    def test_truth_batches_match_unsplit_reference(self):
+        env=SubGaussianEnvironment('uniform',np.array([[.1,.2],[-.2,.3]]))
+        target=lambda seed:ContextualTSPolicy(2,1,n_prob_mc=10,seed=seed)
+        for backend in ['python','numba']:
+            full=regret_rollouts(env,target,context_sampler(1),4,7,seed=92,backend=backend)
+            chunks=[regret_rollouts(env,target,context_sampler(1),4,min(3,7-start),
+                       seed=92,backend=backend,trajectory_offset=start,return_samples=True)
+                    for start in range(0,7,3)]
+            for key,out in [('values','value'),('regrets','regret')]:
+                values=np.concatenate([c[key] for c in chunks])
+                self.assertEqual(float(values.mean()),full[out])
+                self.assertEqual(float(values.std(ddof=1)/np.sqrt(7)),full[out+'_se'])
 
     def test_failure_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:

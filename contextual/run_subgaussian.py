@@ -81,6 +81,7 @@ def build_parser():
     p.add_argument('--cadr_variance_floor',type=float,default=1e-8)
     p.add_argument('--cadr_warmup_sigma',type=float,default=1.)
     p.add_argument('--save_path',type=Path,default=Path('results/contextual_svi.json'))
+    p.add_argument('--truth_batch_size', type=int, default=1000, help='Truth trajectories per worker task')
     p.add_argument('--n_jobs', type=int, default=1, help='Offline dataset workers; -1 uses available CPUs')
     p.add_argument('--backend', choices=['auto','numba','python'], default='auto')
     p.add_argument('--rollout_block_size', type=int, default=128)
@@ -175,15 +176,15 @@ def _safe_replication_task(task):
 
 
 def _truth_task(task):
-    args,beta,T=task
+    args,beta,T,start,count=task
     env = SubGaussianEnvironment(args.env,beta,args.scales,args.half_widths,
                                  None if args.mixtures_json is None else json.loads(args.mixtures_json))
     sampler = context_sampler(args.context_dim,args.context_var)
     behavior = policy_builder(args,args.pi0,args.epsilon0)
     target = policy_builder(args,args.pi1,args.epsilon1)
-    return T,regret_rollouts(env,target,sampler,T,args.truth_reps,seed=args.seed+900000+T,
+    return T,start,regret_rollouts(env,target,sampler,T,count,seed=args.seed+900000+T,
                             backend=args.backend,block_size=args.rollout_block_size,
-                            progress=args.progress and args.n_jobs==1)
+                            progress=False,trajectory_offset=start,return_samples=True)
 
 
 def _worker_init():
@@ -232,7 +233,28 @@ def run(args):
     if args.backend == 'numba':
         from .accelerated import NUMBA_AVAILABLE
         if not NUMBA_AVAILABLE: raise ImportError('Install numba to select the numba backend')
-    truth=dict(_map_tasks(_truth_task,[(args,beta,T) for T in args.T_values],args,'True policy values'))
+    if args.truth_batch_size < 1:
+        raise ValueError('truth_batch_size must be positive')
+    # Fixed trajectory indices preserve seeds across task sizes and worker schedules.
+    truth_tasks=[(args,beta,T,start,min(args.truth_batch_size,args.truth_reps-start))
+                 for start in range(0,args.truth_reps,args.truth_batch_size)
+                 for T in args.T_values]
+    samples={T:dict(values=np.empty(args.truth_reps),regrets=np.empty(args.truth_reps))
+             for T in args.T_values}
+    backends={}
+    for T,start,result in _map_tasks(_truth_task,truth_tasks,args,'True policy batches'):
+        count=len(result['values'])
+        for key in ['values','regrets']:
+            samples[T][key][start:start+count]=result[key]
+        backends[T]=result['backend']
+    truth={}
+    for T,data in samples.items():
+        values,regrets=data['values'],data['regrets']
+        truth[T]=dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(args.truth_reps)),
+                      regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(args.truth_reps)))
+        if backends[T]=='numba': truth[T]['backend']='numba'
+    del samples
+
     records=[];baseline_records=[];failures=[]
     args.save_path.parent.mkdir(parents=True,exist_ok=True)
     checkpoint=args.save_path.with_suffix('.replications.jsonl')
