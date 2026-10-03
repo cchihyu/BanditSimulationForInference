@@ -134,10 +134,50 @@ CADR snapshots and transport can require O(n^2) time/storage for growing policie
 
 The original parametric runner remains available as `python -m contextual.run_contextual`.
 The new model follows its `fit`, `mean`, `sample`, and `score` interface, including
-optional custom feature maps through the Python API. Sub-Gaussian simulation uses
-the generic path; optimized legacy Gaussian paths retain their existing behavior
-except that TS policy updates now correctly use the policy's observation variance.
+optional custom feature maps through the Python API. The sub-Gaussian runner now selects compiled simulation for supported built-in
+environments and policies. Custom feature maps and models retain the Python path.
+Legacy Gaussian simulation paths retain their existing behavior.
 
 ```bash
 python -m unittest discover -s tests -p 'test_contextual_subgaussian.py' -v
+```
+
+
+## Progress and parallel simulation
+
+The sub-Gaussian runner accepts `--n_jobs 8 --backend numba
+--rollout_block_size 128 --progress`. Choose a worker count within your cluster CPU
+allocation. `--n_jobs -1` uses CPUs visible to the process; it may exceed a scheduler
+allocation without CPU affinity restrictions. Default worker count is one.
+
+Progress bars are enabled by default (`--no-progress` disables them). Multiple
+workers parallelize independent offline datasets and truth estimates by horizon;
+worker BLAS threads are limited to one to avoid oversubscription. Install the
+updated environment or run `python -m pip install numba tqdm threadpoolctl`.
+
+`--backend auto` (default) uses Numba when available and supported; `--backend
+python` selects the reference implementation. Explicit `--backend numba` raises
+if unavailable or unsupported. Compiled kernels cover reward generation, policy
+updates, rollout gradients, and regret simulation for built-in uniform,
+contextual epsilon-greedy, and Gaussian Thompson policies. Model fitting and
+baseline bootstrap calculations remain Python. Compilation adds startup time.
+
+Rollouts run in blocks to avoid retaining all trajectory histories. Thompson
+sampling computes scalar Gaussian predictions instead of sampling full coefficient
+vectors, preserving the prediction law and the requested `--ts_prob_mc` budget.
+For a fixed backend and seed, results are reproducible across worker counts and
+block sizes; Python and Numba use different random streams.
+
+Each completed dataset is flushed to a companion `.replications.jsonl` checkpoint.
+This is a record of completed work, not automatic resume support; a new run with
+the same output path overwrites it. The default `--on_error raise` stops on a failed
+fit. Optional `--on_error continue` records failures and proceeds to other datasets.
+This does not fix logistic separation. Summaries report successful and failed counts;
+`coverage` uses successful datasets, while `coverage_all_requested` counts failed
+datasets as not covered. Neither should hide the failure rate.
+
+Validate both the statistical extensions and performance paths with:
+
+```bash
+python -m unittest discover -s tests -p 'test_contextual_*.py' -v
 ```

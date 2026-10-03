@@ -8,4 +8,5 @@ dependencies:
   - scipy
   - tqdm
   - numba
+  - threadpoolctl
   - cvxopt

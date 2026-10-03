@@ -85,6 +85,8 @@ def make_run_args(args: argparse.Namespace, env: str, pi0: str, pi1: str, toff: 
 
 
 def per_trajectory_gradients(reward_model, sim_result: dict, lambda_hat: np.ndarray) -> np.ndarray:
+    if "trajectory_gradients" in sim_result:
+        return np.asarray(sim_result["trajectory_gradients"])
     contexts = np.asarray(sim_result["all_contexts"])
     actions = np.asarray(sim_result["all_actions"])
     rewards = np.asarray(sim_result["all_rewards"])

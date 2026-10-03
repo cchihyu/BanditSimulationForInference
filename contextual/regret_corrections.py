@@ -30,13 +30,27 @@ class MixtureCandidate:
 
 
 def regret_rollouts(environment, policy_builder, context_sampler, horizon, reps,
-                    benchmark='unrestricted', epsilon=0., seed=2026):
+                    benchmark='unrestricted', epsilon=0., seed=2026, *,
+                    backend='python', block_size=128, progress=False):
     if benchmark not in {'unrestricted','epsilon_floor'} or not 0 <= epsilon <= 1:
         raise ValueError('Invalid benchmark')
     if horizon < 1 or reps < 2:
         raise ValueError('Positive horizon and >=2 rollouts required')
+    from .accelerated import simulate
+    fast=simulate(environment,policy_builder,context_sampler,horizon,reps,seed,
+                  benchmark_epsilon=epsilon if benchmark=='epsilon_floor' else 0.,
+                  backend=backend,block_size=block_size,progress=progress,
+                  description='Policy value / regret')
+    if fast is not None:
+        values=fast['expected']; regrets=fast['regrets']
+        return dict(value=float(values.mean()),value_se=float(values.std(ddof=1)/np.sqrt(reps)),
+                    regret=float(regrets.mean()),regret_se=float(regrets.std(ddof=1)/np.sqrt(reps)),backend='numba')
     values = np.zeros(reps); regrets = np.zeros(reps)
-    for rep in range(reps):
+    repetitions=range(reps)
+    if progress:
+        from tqdm.auto import tqdm
+        repetitions=tqdm(repetitions,desc='Python policy rollouts',leave=False)
+    for rep in repetitions:
         seeds = np.random.SeedSequence([seed,rep]).spawn(4)
         xr,ar,rr = [np.random.default_rng(s) for s in seeds[:3]]
         policy = policy_builder(int(seeds[3].generate_state(1)[0]))
@@ -65,7 +79,8 @@ def regret_rollouts(environment, policy_builder, context_sampler, horizon, reps,
 def search_mixture_regret(model, policy_builder, context_sampler, horizon,
                           candidate_count=20, components=3, screen_rollouts=50,
                           refine_rollouts=200, n_refine=5, benchmark='unrestricted',
-                          epsilon=0., seed=2026, mc_error_probability=.05):
+                          epsilon=0., seed=2026, mc_error_probability=.05, *,
+                          backend='python', block_size=128, progress=False):
     if candidate_count < 1 or components < 1 or n_refine < 1 or not 0 < mc_error_probability < 1:
         raise ValueError('Invalid mixture search settings')
     rng = np.random.default_rng(seed)
@@ -73,13 +88,13 @@ def search_mixture_regret(model, policy_builder, context_sampler, horizon,
     for _ in range(candidate_count-1):
         candidates.append(MixtureCandidate(model,[standardized_mixture(rng,components) for _ in range(model.n_actions)]))
     screened = [regret_rollouts(e,policy_builder,context_sampler,horizon,screen_rollouts,
-                               benchmark,epsilon,seed+10000) for e in candidates]
+                               benchmark,epsilon,seed+10000,backend=backend,block_size=block_size,progress=progress) for e in candidates]
     order = np.argsort([r['regret'] for r in screened])[-min(n_refine,candidate_count):]
     refined = []
     z = norm.ppf(1-mc_error_probability/len(order))
     for j in order:
         r = regret_rollouts(candidates[j],policy_builder,context_sampler,horizon,refine_rollouts,
-                            benchmark,epsilon,seed+20000)
+                            benchmark,epsilon,seed+20000,backend=backend,block_size=block_size,progress=progress)
         refined.append(dict(candidate=int(j),**r,mc_adjusted_regret=max(0.,r['regret']+z*r['regret_se'])))
     chosen = max(refined,key=lambda r:r['mc_adjusted_regret'])
     return dict(B_T=chosen['mc_adjusted_regret'],method='gaussian_mixture_search',

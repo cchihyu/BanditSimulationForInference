@@ -58,6 +58,8 @@ class ContextualParametricSVI:
         offline_data: dict[str, np.ndarray | int],
         alphas: list[float] | np.ndarray,
         n_reps: int = 500,
+        *, backend: str = "python", rollout_block_size: int = 128,
+        progress: bool = False,
     ) -> ContextualSVIResult:
         contexts, actions, rewards, behavior_probs, T_offline = _unpack_offline_data(offline_data)
         lambda_hat, Sigma = self.reward_model.fit(
@@ -67,23 +69,13 @@ class ContextualParametricSVI:
             behavior_probs=behavior_probs,
         )
 
-        pi1_img = contextual_bandit_exp_runner(
-            reward_model=self.reward_model,
-            eval_policy_builder=self.eval_policy_builder,
-            context_sampler=self.context_sampler,
-            T=self.T,
-            n_reps=n_reps,
-            lambda_params=lambda_hat,
-            algo_seed=self.algo_seed,
-            context_seed=self.context_seed,
-            table_renew=True,
-        )
-
+        pi1_img = simulate_svi_summary(
+            self.reward_model, self.eval_policy_builder, self.context_sampler,
+            self.T, n_reps, lambda_hat, self.algo_seed, self.context_seed,
+            backend=backend, block_size=rollout_block_size, progress=progress)
         gradient = estimate_contextual_svi_gradient(
-            reward_model=self.reward_model,
-            sim_result=pi1_img,
-            lambda_params=lambda_hat,
-        )
+            reward_model=self.reward_model, sim_result=pi1_img,
+            lambda_params=lambda_hat)
         se = float(np.sqrt(max(gradient @ Sigma @ gradient, 0.0)))
         center = float(pi1_img["mean_avg_reward"])
         center_se = float(pi1_img["se_avg_reward"])
@@ -106,6 +98,26 @@ class ContextualParametricSVI:
             Sigma=Sigma,
             pi1_img=pi1_img,
         )
+
+
+def simulate_svi_summary(reward_model, eval_policy_builder, context_sampler,
+                         T, n_reps, lambda_params, algo_seed=2026, context_seed=1013,
+                         backend="python", block_size=128, progress=False):
+    from .accelerated import simulate
+    fast = simulate(reward_model, eval_policy_builder, context_sampler, T, n_reps,
+                    algo_seed, params=lambda_params, gradient=True,
+                    backend=backend, block_size=block_size, progress=progress,
+                    description="SVI inner simulations", context_seed=context_seed)
+    if fast is None:
+        return contextual_bandit_exp_runner(reward_model, eval_policy_builder,
+            context_sampler, T, n_reps, lambda_params, algo_seed, context_seed)
+    values=fast['observed']
+    return dict(mean_avg_reward=float(values.mean()),
+                se_avg_reward=float(values.std(ddof=1)/np.sqrt(n_reps)),
+                std_avg_reward=float(values.std(ddof=1)),
+                trajectory_gradients=fast['trajectory_gradients'],
+                backend='numba', n_rep=n_reps, T=T,
+                algo_seed=algo_seed, context_seed=context_seed)
 
 
 def contextual_bandit_exp_runner(
@@ -558,6 +570,8 @@ def estimate_contextual_svi_gradient(
     sim_result: dict[str, np.ndarray | float | int],
     lambda_params: np.ndarray,
 ) -> np.ndarray:
+    if "trajectory_gradients" in sim_result:
+        return np.asarray(sim_result["trajectory_gradients"]).mean(axis=0)
     contexts = np.asarray(sim_result["all_contexts"], dtype=np.float64)
     actions = np.asarray(sim_result["all_actions"], dtype=np.int64)
     rewards = np.asarray(sim_result["all_rewards"], dtype=np.float64)
