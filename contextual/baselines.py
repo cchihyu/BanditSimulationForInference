@@ -246,6 +246,26 @@ def contextual_cadr_sigmas(
     return sigmas
 
 
+def contextual_cadr_sigmas_static(
+    actions, rewards, behavior_probs, target_probs, min_samples=30,
+    variance_floor=1e-12, warmup_sigma=1.0,
+):
+    """O(n) CADR conditional-scale estimate for a fixed logging policy."""
+    actions=np.asarray(actions,dtype=int);rewards=np.asarray(rewards,dtype=float)
+    behavior_probs=np.asarray(behavior_probs,dtype=float);target_probs=np.asarray(target_probs,dtype=float)
+    if behavior_probs.shape!=target_probs.shape or behavior_probs.shape[0]!=len(rewards):
+        raise ValueError('Probability histories must have matching (n, K) shapes.')
+    chosen=np.arange(len(rewards)),actions
+    scores=target_probs[chosen]*rewards/behavior_probs[chosen]
+    sigmas=np.full(len(rewards),warmup_sigma,dtype=float);running_sum=0.;running_sumsq=0.
+    for t,score in enumerate(scores):
+        if t>=min_samples:
+            variance=running_sumsq/t-(running_sum/t)**2
+            sigmas[t]=np.sqrt(max(float(variance),variance_floor))
+        running_sum+=score;running_sumsq+=score*score
+    return sigmas
+
+
 def cadr_interval(
     rewards: np.ndarray,
     weights: np.ndarray,
@@ -839,6 +859,8 @@ def compute_all_contextual_intervals(
     cadr_variance_floor: float = 1e-12,
     cadr_warmup_sigma: float = 1.0,
     cadr_target_is_fixed: bool = True,
+    allow_adaptive_cadr: bool = False,
+    cadr_behavior_is_static: bool = False,
     include_cadr: bool = True,
 ) -> ContextualBaselineIntervals:
     contexts, actions, rewards, behavior_probs = _validate_contextual_inputs(
@@ -889,15 +911,20 @@ def compute_all_contextual_intervals(
         raise ValueError("DR/CADR wrapper supports one_step only; cumulative weights require sequential inference.")
     cadr = (float("nan"), float("nan"))
     if include_cadr:
-        if not cadr_target_is_fixed:
-            raise ValueError("CADR requires a fixed contextual target; adaptive target inference is not implemented.")
+        if not cadr_target_is_fixed and not allow_adaptive_cadr:
+            raise ValueError("Set allow_adaptive_cadr=True to compute adaptive-target CADR.")
         if cadr_conditional_sigmas is None:
-            if cadr_current_behavior_probs is None:
+            if cadr_behavior_is_static:
+                cadr_conditional_sigmas=contextual_cadr_sigmas_static(
+                    actions,rewards,behavior_probs,pi_hist,cadr_min_samples,
+                    cadr_variance_floor,cadr_warmup_sigma)
+            elif cadr_current_behavior_probs is None:
                 raise ValueError("Supply cadr_current_behavior_probs, cadr_conditional_sigmas, or disable CADR.")
-            cadr_conditional_sigmas = contextual_cadr_sigmas(
-                contexts, actions, rewards, behavior_probs, pi_hist,
-                cadr_current_behavior_probs, cadr_min_samples,
-                cadr_variance_floor, cadr_warmup_sigma)
+            else:
+                cadr_conditional_sigmas = contextual_cadr_sigmas(
+                    contexts, actions, rewards, behavior_probs, pi_hist,
+                    cadr_current_behavior_probs, cadr_min_samples,
+                    cadr_variance_floor, cadr_warmup_sigma)
         cadr = cadr_interval(rewards, weights, conf_level,
                              conditional_sigmas=cadr_conditional_sigmas)
     dr_function = (contextual_dr_bootstrap_interval if dr_ci_method == "bootstrap"

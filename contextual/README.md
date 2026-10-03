@@ -81,7 +81,8 @@ probabilities. The TS observation scale remains fixed across candidate environme
 `--regret_methods` supports both methods in one run:
 
 * `gaussian_mixture_search`: includes the fitted Gaussian environment, screens
-  `--candidate_count` candidates, and independently refines `--n_refine` of them.
+  `--candidate_count` candidates, and refines `--n_refine` of them while retaining
+  their screening trajectories.
   `--mixture_components`, `--screen_rollouts`, `--refine_rollouts`, and
   `--mc_error_probability` configure the search. Candidates are analytically scaled
   using max component variance + component-mean range squared / 4, a sufficient
@@ -114,21 +115,29 @@ for adaptive logging. Reported coverage treats the independently simulated truth
 its reference; inspect its SE. SVI center MC error is recorded, not added to the CI.
 Finite-search and plug-in corrections do not guarantee nominal coverage.
 
+At completion, the runner also prints the truth estimate, successful and failed
+replication counts, base and corrected coverage, coverage MC SE, mean center and bias,
+base and corrected widths, mean endpoint correction, and all saved-file paths. Output
+continues to appear in the terminal when piped through `tee` and is copied to the log.
+
 `--select_M` enables existing gradient-pilot replication selection, with controls
 `--M_pilot`, `--M_bootstrap_reps`, `--Mmax`, `--M_tau`, `--M_rel_eps`. It monitors
 width stability, not center MC error. Capped selections are recorded.
 
-`--include_baselines` uses bootstrap DR by default (`--dr_ci_method wald` retains
-Wald). Set `--dr_bootstrap_reps`; bootstrap seeds derive reproducibly from the run
-seed. Scaled Bernoulli DR fits logistic probabilities on rewards divided by scale.
-DR/IPW for adaptive evaluation policies are labeled logged-history comparisons,
-not fresh-deployment estimators. CADR is included for the fixed uniform target and
-omitted for adaptive evaluation targets. Pre-observation logging-policy snapshots
-supply current-to-past propensity transport; `--ts_prob_mc` also controls these
-probability estimates. CADR warm-up and floors have dedicated flags. ELFCB is opt-in
-and still uses observed extrema, not certified population support bounds. Missing
+IPW, bootstrap DR, and ELF-CB baselines run by default. Use `--no-include_baselines`
+for an SVI-only diagnostic run, or `--no-include_elfcb` to omit ELF-CB. The option
+`--dr_ci_method wald` replaces bootstrap DR. Set `--dr_bootstrap_reps`; bootstrap
+seeds derive reproducibly from the run seed. Scaled Bernoulli DR fits logistic
+probabilities on rewards divided by scale.
+For adaptive evaluation policies, IPW, DR, and CADR use target probabilities obtained
+by replaying the logged history. For static uniform logging, the CADR conditional scale
+sequence is computed in O(n) time. For adaptive logging, pre-observation logging-policy
+snapshots supply current-to-past propensity
+transport; `--ts_prob_mc` also controls those probability estimates, and this path can
+require O(n^2) work. CADR warm-up and floors have dedicated flags. ELF-CB uses
+observed extrema, not certified population support bounds. Missing
 intervals are JSON null; bootstrap fit failures raise rather than being discarded.
-CADR snapshots and transport can require O(n^2) time/storage for growing policies.
+CADR snapshots and transport can require O(n^2) time/storage for growing logging policies.
 
 ## Existing runner and validation
 
@@ -162,9 +171,15 @@ updates, rollout gradients, and regret simulation for built-in uniform,
 contextual epsilon-greedy, and Gaussian Thompson policies. Model fitting and
 baseline bootstrap calculations remain Python. Compilation adds startup time.
 
-Rollouts run in blocks to avoid retaining all trajectory histories. Thompson
-sampling computes scalar Gaussian predictions instead of sampling full coefficient
-vectors, preserving the prediction law and the requested `--ts_prob_mc` budget.
+Rollouts run in blocks to avoid retaining all trajectory histories. Compiled Thompson
+sampling draws one scalar posterior prediction per arm and selects its maximum. This
+is exactly the contextual TS action law at the current context and avoids estimating
+the full action-probability vector. Policy value and pseudo-regret use the selected
+arm's conditional mean, giving unbiased Monte Carlo estimates. `--ts_prob_mc` is used
+only by paths that require explicit propensities, including adaptive baseline work and
+the Python reference implementation. The `epsilon_floor` regret benchmark also checks
+explicit probabilities. With the default `unrestricted` benchmark, `--ts_prob_mc`
+does not multiply compiled rollout cost.
 For a fixed backend and seed, results are reproducible across worker counts and
 block sizes; Python and Numba use different random streams.
 

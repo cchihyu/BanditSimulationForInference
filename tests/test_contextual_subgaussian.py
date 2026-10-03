@@ -11,7 +11,7 @@ from contextual.regret_corrections import regret_rollouts, search_mixture_regret
 from contextual.contextual_bsi import ContextualParametricSVI, ContextualParametricBSI, contextual_bandit_exp_runner, estimate_contextual_svi_gradient
 from contextual.select_inner_reps import per_trajectory_gradients
 from contextual.run_subgaussian import build_parser,run
-from contextual.baselines import cadr_interval, contextual_cadr_sigmas, contextual_dr_bootstrap_interval, PerActionLinearRewardModel
+from contextual.baselines import cadr_interval, contextual_cadr_sigmas, contextual_cadr_sigmas_static, contextual_dr_bootstrap_interval, PerActionLinearRewardModel
 
 
 class SubGaussianTests(unittest.TestCase):
@@ -113,6 +113,8 @@ class SubGaussianTests(unittest.TestCase):
         np.testing.assert_allclose(ci,[y.mean()-norm.ppf(.975),y.mean()+norm.ppf(.975)])
         sig=contextual_cadr_sigmas(x,a,y,p,p,lambda t,x:np.ones((t,1)),min_samples=2)
         np.testing.assert_allclose(sig[2:],[np.std(y[:2]),np.std(y[:3])])
+        static=contextual_cadr_sigmas_static(a,y,p,p,min_samples=2)
+        np.testing.assert_allclose(static,sig)
         class Counter(PerActionLinearRewardModel):
             count=0
             def fit(self,*args,**kwargs):
@@ -132,7 +134,7 @@ class SubGaussianTests(unittest.TestCase):
                     '--T_values','2','--T_offline_values','100','--offline_reps','1','--inner_reps','4',
                     '--truth_reps','4','--candidate_count','2','--screen_rollouts','3','--refine_rollouts','3',
                     '--proxy_grid_size','101','--variance_methods',*methods,'--regret_methods','gaussian_mixture_search','minimax_bound',
-                    '--save_path',str(Path(tmp)/f'{env}.json')])
+                    '--no-include_baselines','--save_path',str(Path(tmp)/f'{env}.json')])
                 payload=run(args);self.assertEqual(len(payload['records']),len(methods)*2)
             args=build_parser().parse_args(['--env','uniform','--n_actions','2','--context_dim','1',
                 '--pi0','contextual_epsilon','--pi1','uniform','--propagate_variance_uncertainty',
@@ -142,6 +144,14 @@ class SubGaussianTests(unittest.TestCase):
             payload=run(args)
             self.assertEqual(payload['records'][0]['primary_type'],'projection')
             self.assertTrue(np.isfinite(payload['baselines'][0]['intervals']['cadr']).all())
+            args=build_parser().parse_args(['--env','uniform','--n_actions','2','--context_dim','1',
+                '--pi0','uniform','--pi1','contextual_ts','--ts_prob_mc','10',
+                '--T_values','2','--T_offline_values','100','--offline_reps','1','--inner_reps','4','--truth_reps','4',
+                '--regret_methods','minimax_bound','--dr_bootstrap_reps','3','--no-include_elfcb',
+                '--save_path',str(Path(tmp)/'adaptive_target.json')])
+            payload=run(args)
+            self.assertTrue(np.isfinite(payload['baselines'][0]['intervals']['cadr']).all())
+            self.assertEqual(payload['baselines'][0]['target_interpretation'],'adaptive contextual target')
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -167,7 +177,7 @@ class CompatibilityTests(unittest.TestCase):
                 '--propagate_variance_uncertainty','--pi1','contextual_ts','--ts_prob_mc','10',
                 '--T_values','2','--T_offline_values','150','--offline_reps','1','--truth_reps','3',
                 '--select_M','--M_pilot','3','--M_bootstrap_reps','3','--Mmax','5',
-                '--regret_methods','minimax_bound','--save_path',str(Path(tmp)/'pilot.json')])
+                '--regret_methods','minimax_bound','--no-include_baselines','--save_path',str(Path(tmp)/'pilot.json')])
             payload=run(args);self.assertTrue(payload['records'][0]['variance_uncertainty_propagated'])
             self.assertLessEqual(payload['records'][0]['inner_reps'],5)
 

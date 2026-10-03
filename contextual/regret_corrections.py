@@ -129,27 +129,10 @@ def search_mixture_regret(model, policy_builder, context_sampler, horizon,
                           refine_rollouts=200, n_refine=5, benchmark='unrestricted',
                           epsilon=0., seed=2026, mc_error_probability=.05, *,
                           backend='python', block_size=128, progress=False):
-    if candidate_count < 1 or components < 1 or n_refine < 1 or not 0 < mc_error_probability < 1:
-        raise ValueError('Invalid mixture search settings')
-    rng = np.random.default_rng(seed)
-    candidates = [model]  # the exact fitted Gaussian working environment
-    for _ in range(candidate_count-1):
-        candidates.append(MixtureCandidate(model,[standardized_mixture(rng,components) for _ in range(model.n_actions)]))
-    screened = [regret_rollouts(e,policy_builder,context_sampler,horizon,screen_rollouts,
-                               benchmark,epsilon,seed+10000,backend=backend,block_size=block_size,progress=progress) for e in candidates]
-    order = np.argsort([r['regret'] for r in screened])[-min(n_refine,candidate_count):]
-    refined = []
-    z = norm.ppf(1-mc_error_probability/len(order))
-    for j in order:
-        r = regret_rollouts(candidates[j],policy_builder,context_sampler,horizon,refine_rollouts,
-                            benchmark,epsilon,seed+20000,backend=backend,block_size=block_size,progress=progress)
-        refined.append(dict(candidate=int(j),**r,mc_adjusted_regret=max(0.,r['regret']+z*r['regret_se'])))
-    chosen = max(refined,key=lambda r:r['mc_adjusted_regret'])
-    return dict(B_T=chosen['mc_adjusted_regret'],method='gaussian_mixture_search',
-                guarantee='empirical finite-library search; normal MC adjustment is approximate',
-                proxy_constraint='component-bound certified candidates within fitted proxy budget',
-                candidate_count=candidate_count,screened=screened,refined=refined,
-                raw_max_regret=max(0.,max(r['regret'] for r in refined)),benchmark=benchmark)
+    return search_mixture_regret_horizons(
+        model,policy_builder,context_sampler,[horizon],candidate_count,components,
+        screen_rollouts,refine_rollouts,n_refine,benchmark,epsilon,seed,
+        mc_error_probability,backend=backend,block_size=block_size,progress=progress)[horizon]
 
 
 def search_mixture_regret_horizons(model, policy_builder, context_sampler, horizons,
@@ -159,7 +142,8 @@ def search_mixture_regret_horizons(model, policy_builder, context_sampler, horiz
                                    backend='python', block_size=128, progress=False):
     """Share each candidate trajectory across all requested horizons."""
     checkpoints=sorted(set(int(h) for h in horizons))
-    if candidate_count<1 or components<1 or n_refine<1 or not 0<mc_error_probability<1:
+    if (candidate_count<1 or components<1 or n_refine<1 or
+            refine_rollouts<screen_rollouts or not 0<mc_error_probability<1):
         raise ValueError('Invalid mixture search settings')
     rng=np.random.default_rng(seed);candidates=[model]
     for _ in range(candidate_count-1):
@@ -170,17 +154,22 @@ def search_mixture_regret_horizons(model, policy_builder, context_sampler, horiz
     screen_means=np.array([[s['regrets'][:,j].mean() for j in range(len(checkpoints))] for s in screened_samples])
     selected={T:np.argsort(screen_means[:,j])[-min(n_refine,candidate_count):] for j,T in enumerate(checkpoints)}
     union=sorted(set(int(i) for indices in selected.values() for i in indices))
-    refined_samples={i:regret_rollouts_horizons(candidates[i],policy_builder,context_sampler,checkpoints,refine_rollouts,
-                    benchmark,epsilon,seed+20000,backend=backend,block_size=block_size,
-                    progress=progress,return_samples=True) for i in union}
+    additional=refine_rollouts-screen_rollouts
+    extra_samples={}
+    if additional:
+        extra_samples={i:regret_rollouts_horizons(candidates[i],policy_builder,context_sampler,checkpoints,additional,
+                       benchmark,epsilon,seed+20000,backend=backend,block_size=block_size,
+                       progress=progress,return_samples=True) for i in union}
     output={}
     for j,T in enumerate(checkpoints):
         order=selected[T];z=norm.ppf(1-mc_error_probability/len(order));refined=[]
         for i in order:
-            sample=refined_samples[int(i)]['regrets'][:,j]
+            i=int(i);parts=[screened_samples[i]['regrets'][:,j]]
+            if additional:parts.append(extra_samples[i]['regrets'][:,j])
+            sample=np.concatenate(parts)
             mean=float(sample.mean());se=float(sample.std(ddof=1)/np.sqrt(refine_rollouts))
             refined.append(dict(candidate=int(i),regret=mean,regret_se=se,
-                                mc_adjusted_regret=max(0.,mean+z*se),backend=refined_samples[int(i)]['backend']))
+                                mc_adjusted_regret=max(0.,mean+z*se),backend=screened_samples[i]['backend']))
         chosen=max(refined,key=lambda r:r['mc_adjusted_regret'])
         output[T]=dict(B_T=chosen['mc_adjusted_regret'],method='gaussian_mixture_search',
             guarantee='empirical finite-library search; normal MC adjustment is approximate',

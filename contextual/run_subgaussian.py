@@ -74,8 +74,10 @@ def build_parser():
     p.add_argument('--bound_formula',choices=['linear_dimension','mab_rate'],default='linear_dimension')
     p.add_argument('--bound_constant',type=float,default=1.)
     p.add_argument('--bound_log',action=argparse.BooleanOptionalAction,default=True)
-    p.add_argument('--include_baselines',action='store_true')
-    p.add_argument('--include_elfcb',action='store_true')
+    p.add_argument('--include_baselines',action=argparse.BooleanOptionalAction,default=True,
+                   help='Run IPW, DR, and supported CADR baselines (default: enabled)')
+    p.add_argument('--include_elfcb',action=argparse.BooleanOptionalAction,default=True,
+                   help='Run ELF-CB with the other baselines (default: enabled)')
     p.add_argument('--dr_ci_method',choices=['bootstrap','wald'],default='bootstrap')
     p.add_argument('--dr_bootstrap_reps',type=int,default=1000)
     p.add_argument('--cadr_min_samples',type=int,default=30)
@@ -117,19 +119,20 @@ def _replication_task(task):
     target = policy_builder(args,args.pi1,args.epsilon1)
     seed = int(np.random.SeedSequence([args.seed,n,rep]).generate_state(1)[0])
     offline,callback = collect_subgaussian_data(env,behavior,sampler,n,seed,
-        retain_policy_states=args.include_baselines and args.pi1 == 'uniform')
+        retain_policy_states=args.include_baselines and args.pi0 != 'uniform')
     if args.include_baselines:
         model = ScaledBernoulliBaselineModel(env.scales) if args.env == 'scaled_bernoulli' else PerActionLinearRewardModel()
         base = compute_all_contextual_intervals(
             offline['contexts'],offline['actions'],offline['rewards'],offline['behavior_probs'],
             target(seed+1),1-args.alpha,reward_model=model,include_elfcb=args.include_elfcb,
             dr_ci_method=args.dr_ci_method,dr_bootstrap_reps=args.dr_bootstrap_reps,
-            dr_bootstrap_seed=seed+2,include_cadr=args.pi1 == 'uniform',
+            dr_bootstrap_seed=seed+2,include_cadr=True,
             cadr_current_behavior_probs=callback,cadr_min_samples=args.cadr_min_samples,
-            cadr_variance_floor=args.cadr_variance_floor,cadr_warmup_sigma=args.cadr_warmup_sigma)
+            cadr_variance_floor=args.cadr_variance_floor,cadr_warmup_sigma=args.cadr_warmup_sigma,
+            cadr_target_is_fixed=args.pi1 == 'uniform',allow_adaptive_cadr=True,
+            cadr_behavior_is_static=args.pi0 == 'uniform')
         baseline_records.append(dict(n=n,rep=rep,intervals=vars(base),
-            target_interpretation='fixed contextual value' if args.pi1 == 'uniform' else 'one-step logged-history comparison; not fresh adaptive deployment',
-            cadr_status='included' if args.pi1 == 'uniform' else 'omitted: adaptive evaluation target unsupported'))
+            target_interpretation='fixed contextual target' if args.pi1 == 'uniform' else 'adaptive contextual target'))
     for method in args.variance_methods:
         model = ContextualSubGaussianWorkingModel(args.n_actions,args.context_dim,args.env,method,
             scales=env.scales,support_widths=None if args.env == 'gaussian_mixture' else env.support_widths(),
@@ -310,9 +313,14 @@ def run(args):
                         successful_reps=len(group),failed_reps=args.offline_reps-len(group),
                         coverage_all_requested=float(sum(r['covered'] for r in group)/args.offline_reps),
                         base_coverage=float(np.mean([r['base_covered'] for r in group])) if group else float('nan'),
-                        mean_width=float(np.mean([r['width'] for r in group])) if group else float('nan'),mean_bias=float(np.mean([r['bias'] for r in group])) if group else float('nan')))
+                        mean_center=float(np.mean([r['center'] for r in group])) if group else float('nan'),
+                        mean_base_width=float(np.mean([r['base'][1]-r['base'][0] for r in group])) if group else float('nan'),
+                        mean_correction=float(np.mean([r['regret']['B_T']/T for r in group])) if group else float('nan'),
+                        mean_width=float(np.mean([r['width'] for r in group])) if group else float('nan'),
+                        mean_bias=float(np.mean([r['bias'] for r in group])) if group else float('nan')))
+    baseline_results=baseline_summary(baseline_records,truth)
     payload=dict(config=vars(args),true_beta=beta,truth=truth,records=records,summary=summaries,baselines=baseline_records,failures=failures,checkpoint=str(checkpoint),
-        baseline_summary=baseline_summary(baseline_records,truth),
+        baseline_summary=baseline_results,
         method='SVI',qualification='Empirical corrections with plug-in parameters; no certified worst-case coverage guarantee',
         context_distribution='known Gaussian',policy_model='linear working learner on every reward environment')
     args.save_path.parent.mkdir(parents=True,exist_ok=True)
@@ -320,7 +328,42 @@ def run(args):
     import csv
     with args.save_path.with_suffix('.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=list(summaries[0]));writer.writeheader();writer.writerows(clean_json(summaries))
+    print_terminal_summary(truth,summaries,baseline_results,args.save_path,checkpoint)
     return payload
+
+
+def print_terminal_summary(truth, summaries, baseline_results, save_path, checkpoint):
+    print('\n=== Contextual SVI coverage results ===')
+    for T in sorted(truth):
+        item=truth[T]
+        print(f"Truth T={T}: value={item['value']:.6f}, MC SE={item['value_se']:.6f}")
+    for item in summaries:
+        print(
+            f"T_offline={item['n']}, T={item['T']}, variance={item['variance_method']}, "
+            f"correction={item['regret_method']}\n"
+            f"  successful={item['successful_reps']}, failed={item['failed_reps']}\n"
+            f"  base coverage={item['base_coverage']:.4f}, corrected coverage={item['coverage']:.4f}, "
+            f"coverage MC SE={item['coverage_mc_se']:.4f}\n"
+            f"  coverage over all requested={item['coverage_all_requested']:.4f}\n"
+            f"  mean center={item['mean_center']:.6f}, mean bias={item['mean_bias']:.6f}\n"
+            f"  mean base width={item['mean_base_width']:.6f}, "
+            f"mean endpoint correction={item['mean_correction']:.6f}, "
+            f"mean corrected width={item['mean_width']:.6f}"
+        )
+    if baseline_results:
+        print('\n=== Baseline results (uncorrected) ===')
+        for item in baseline_results:
+            print(
+                f"T_offline={item['n']}, T={item['T']}, method={item['method']}: "
+                f"coverage={item['coverage']:.4f}, mean width={item['mean_width']:.6f}, "
+                f"valid={item['valid_reps']}, missing={item['missing_reps']}\n"
+                f"  target: {item['target_interpretation']}"
+            )
+    else:
+        print('\nBaseline results: none available.')
+    print(f"JSON: {save_path}")
+    print(f"CSV: {save_path.with_suffix('.csv')}")
+    print(f"Checkpoint: {checkpoint}")
 
 
 def clean_json(value):

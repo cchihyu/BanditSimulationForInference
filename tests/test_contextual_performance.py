@@ -1,16 +1,19 @@
 import json
+import io
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 import numpy as np
 from scipy.stats import norm
-from contextual.accelerated import NUMBA_AVAILABLE, simulate, posterior_update, linear_ts_probabilities, rollout_block
+from contextual.accelerated import NUMBA_AVAILABLE, simulate, posterior_update, linear_ts_probabilities, linear_ts_action, rollout_block
 from contextual.algorithms import ContextualTSPolicy, ContextualEpsilonGreedyPolicy
 from contextual.simulation import UniformContextualPolicy, context_sampler, collect_subgaussian_data
 from contextual.subgaussian_environments import SubGaussianEnvironment
 from contextual.environments import ContextualSubGaussianWorkingModel
-from contextual.regret_corrections import regret_rollouts, regret_rollouts_horizons, MixtureCandidate, standardized_mixture
-from contextual.run_subgaussian import build_parser,run
+from contextual.regret_corrections import regret_rollouts, regret_rollouts_horizons, search_mixture_regret_horizons, MixtureCandidate, standardized_mixture
+from contextual.run_subgaussian import build_parser,run,print_terminal_summary
 
 
 @unittest.skipUnless(NUMBA_AVAILABLE,'Numba not installed')
@@ -33,6 +36,17 @@ class CompiledTests(unittest.TestCase):
         probs=linear_ts_probabilities(means,cov,x,100000,1e-8)
         self.assertLess(abs(probs[0]-expected),.009)
         self.assertTrue(linear_ts_probabilities.nopython_signatures)
+
+    def test_compiled_ts_uses_one_draw_not_probability_mc(self):
+        env=SubGaussianEnvironment('uniform',np.array([[.1,.2],[-.2,.3]]))
+        def target(draws):
+            return lambda seed:ContextualTSPolicy(2,1,n_prob_mc=draws,seed=seed)
+        low=simulate(env,target(1),context_sampler(1),8,20,73,backend='numba')
+        high=simulate(env,target(2000),context_sampler(1),8,20,73,backend='numba')
+        for key in ['observed','expected','regrets']:
+            np.testing.assert_array_equal(low[key],high[key])
+        linear_ts_action(np.zeros((2,2)),np.repeat(np.eye(2)[None,:,:],2,axis=0),np.ones(2))
+        self.assertEqual(low['ts_action_draws'],1);self.assertTrue(linear_ts_action.nopython_signatures)
 
     def test_block_invariance_and_all_environments(self):
         for kind in ['uniform','scaled_bernoulli','gaussian_mixture']:
@@ -83,7 +97,8 @@ class CompiledTests(unittest.TestCase):
                     '--T_offline_values','80','--offline_reps','3','--inner_reps','4','--truth_reps','4',
                     '--candidate_count','2','--screen_rollouts','3','--refine_rollouts','3',
                     '--regret_methods','gaussian_mixture_search','minimax_bound','--backend','numba',
-                    '--truth_batch_size','1' if jobs==2 else '3','--n_jobs',str(jobs),'--no-progress','--save_path',str(Path(tmp)/f'j{jobs}.json')])
+                    '--truth_batch_size','1' if jobs==2 else '3','--n_jobs',str(jobs),'--no-progress',
+                    '--no-include_baselines','--save_path',str(Path(tmp)/f'j{jobs}.json')])
             one=run(args(1));two=run(args(2))
             self.assertEqual(one['truth'],two['truth'])
             self.assertEqual(one['summary'],two['summary'])
@@ -117,12 +132,24 @@ class CompiledTests(unittest.TestCase):
             np.testing.assert_array_equal(shared['values'][:,j],separate['values'])
             np.testing.assert_array_equal(shared['regrets'][:,j],separate['regrets'])
 
+    def test_mixture_refinement_reuses_screening(self):
+        import contextual.regret_corrections as corrections
+        env=SubGaussianEnvironment('uniform',np.array([[.1],[-.2]]))
+        target=lambda seed:ContextualTSPolicy(2,0,n_prob_mc=2000,seed=seed)
+        calls=[];original=corrections.regret_rollouts_horizons
+        def recording(*args,**kwargs):
+            calls.append(args[4]);return original(*args,**kwargs)
+        with patch.object(corrections,'regret_rollouts_horizons',side_effect=recording):
+            search_mixture_regret_horizons(env,target,context_sampler(0),[3],candidate_count=1,
+                screen_rollouts=3,refine_rollouts=5,n_refine=1,backend='numba')
+        self.assertEqual(calls,[3,2])
+
     def test_failure_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             args=build_parser().parse_args(['--env','scaled_bernoulli','--n_actions','2','--context_dim','0',
                 '--beta','-100','-100','--T_values','2','--T_offline_values','30','--offline_reps','2',
                 '--inner_reps','3','--truth_reps','3','--regret_methods','minimax_bound','--backend','numba',
-                '--on_error','continue','--no-progress','--save_path',str(Path(tmp)/'fail.json')])
+                '--on_error','continue','--no-progress','--no-include_baselines','--save_path',str(Path(tmp)/'fail.json')])
             result=run(args)
             self.assertEqual(len(result['failures']),2)
             self.assertEqual(result['summary'][0]['failed_reps'],2)
@@ -134,12 +161,33 @@ class CompiledTests(unittest.TestCase):
             common=['--env','uniform','--n_actions','2','--context_dim','0','--T_values','2','4',
                     '--T_offline_values','20','--offline_reps','1','--inner_reps','3','--truth_reps','4',
                     '--regret_methods','minimax_bound','--backend','numba','--no-progress',
-                    '--truth_cache_path',str(cache)]
+                    '--no-include_baselines','--truth_cache_path',str(cache)]
             first=build_parser().parse_args(common+['--pi0','uniform','--save_path',str(Path(tmp)/'a.json')])
             second=build_parser().parse_args(common+['--pi0','contextual_epsilon','--save_path',str(Path(tmp)/'b.json')])
             one=run(first);two=run(second)
             self.assertEqual(one['truth'],two['truth']);self.assertTrue(cache.exists())
             mismatch=build_parser().parse_args(common+['--seed','999','--save_path',str(Path(tmp)/'c.json')])
             with self.assertRaisesRegex(ValueError,'does not match'):run(mismatch)
+
+    def test_terminal_summary(self):
+        summary=dict(n=1000,T=100,variance_method='empirical',regret_method='gaussian_mixture_search',
+            successful_reps=299,failed_reps=1,base_coverage=.89,coverage=.91,coverage_mc_se=.02,
+            coverage_all_requested=.9067,mean_center=.2,mean_bias=.01,mean_base_width=.3,
+            mean_correction=.04,mean_width=.38)
+        output=io.StringIO()
+        with redirect_stdout(output):
+            print_terminal_summary({100:dict(value=.19,value_se=.001)},[summary],[],Path('result.json'),Path('checkpoint.jsonl'))
+        text=output.getvalue()
+        self.assertIn('corrected coverage=0.9100',text)
+        self.assertIn('mean endpoint correction=0.040000',text)
+        self.assertIn('JSON: result.json',text)
+
+    def test_baselines_enabled_by_default(self):
+        defaults=build_parser().parse_args([])
+        self.assertTrue(defaults.include_baselines)
+        self.assertTrue(defaults.include_elfcb)
+        disabled=build_parser().parse_args(['--no-include_baselines','--no-include_elfcb'])
+        self.assertFalse(disabled.include_baselines)
+        self.assertFalse(disabled.include_elfcb)
 
 if __name__=='__main__':unittest.main()

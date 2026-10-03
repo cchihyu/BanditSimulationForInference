@@ -55,6 +55,18 @@ def linear_ts_probabilities(means, covariances, x, n_mc, clip):
 
 
 @njit(cache=True)
+def linear_ts_action(means, covariances, x):
+    """Draw one TS prediction per arm and return the maximizing arm."""
+    winner=0;best=-np.inf
+    for a in range(len(means)):
+        prediction=means[a]@x
+        sd=np.sqrt(max(0.,x@covariances[a]@x))
+        value=prediction+sd*np.random.normal()
+        if value>best:best=value;winner=a
+    return winner
+
+
+@njit(cache=True)
 def choose(probs):
     u=np.random.random(); total=0.
     for a in range(len(probs)):
@@ -84,8 +96,10 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
         for t in range(horizon):
             x[1:]=contexts[rep,t]
             probs=np.full(k,1./k)
+            direct_ts=policy_code==2 and benchmark_epsilon==0.
             if policy_code==2:
-                probs=linear_ts_probabilities(policy_means,cov,x,n_mc,pi_clip)
+                if direct_ts:a=linear_ts_action(policy_means,cov,x)
+                else:probs=linear_ts_probabilities(policy_means,cov,x,n_mc,pi_clip)
             elif policy_code==1:
                 if explore_untried and np.min(counts)==0:
                     probs=(counts==0).astype(np.float64);probs/=probs.sum()
@@ -93,19 +107,20 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                     best=np.argmax(policy_means@x)
                     probs[:]=epsilon/k;probs[best]+=1.-epsilon
             # Match SVI's normalization when requested; regret path uses raw policy probabilities.
-            if probability_floor>0:
+            if probability_floor>0 and not direct_ts:
                 for a in range(k): probs[a]=max(probs[a],probability_floor)
                 probs/=probs.sum()
-            if np.min(probs)<benchmark_epsilon/k-1e-10:
+            if not direct_ts and np.min(probs)<benchmark_epsilon/k-1e-10:
                 raise ValueError('Evaluation policy violates benchmark probability floor')
             means=beta@x
             if logistic:
                 for a in range(k):means[a]=scales[a]*sigmoid(means[a])
-            policy_value=probs@means
+            if not direct_ts:a=choose(probs)
+            policy_value=means[a] if direct_ts else probs@means
             expected_sum+=policy_value
             oracle=(1.-benchmark_epsilon)*np.max(means)+benchmark_epsilon*np.mean(means)
             regret_sum+=oracle-policy_value
-            a=choose(probs);mu=means[a]
+            mu=means[a]
             v=variances[a]
             if logistic:
                 prob=sigmoid(variance_beta[a]@x)
@@ -233,7 +248,8 @@ def simulate(environment, policy_builder, sampler, horizon, reps, seed,
                             *packed,np.array([horizon],dtype=np.int64),float(benchmark_epsilon),
                             1e-12 if gradient else 0.,size)
         observed[start:end],expected[start:end],regrets[start:end],grads[start:end]=result[0][:,0],result[1][:,0],result[2][:,0],result[3]
-    return dict(observed=observed,expected=expected,regrets=regrets,trajectory_gradients=grads,backend='numba')
+    return dict(observed=observed,expected=expected,regrets=regrets,trajectory_gradients=grads,
+                backend='numba',ts_action_draws=1)
 
 
 def simulate_horizons(environment, policy_builder, sampler, horizons, reps, seed,
@@ -266,4 +282,5 @@ def simulate_horizons(environment, policy_builder, sampler, horizons, reps, seed
         result=rollout_block(np.ascontiguousarray(contexts,dtype=float),np.array(seeds,dtype=np.uint32),
                              *packed,checkpoints,float(benchmark_epsilon),0.,0)
         observed[start:end],expected[start:end],regrets[start:end]=result[:3]
-    return dict(horizons=checkpoints,observed=observed,expected=expected,regrets=regrets,backend='numba')
+    return dict(horizons=checkpoints,observed=observed,expected=expected,regrets=regrets,
+                backend='numba',ts_action_draws=1)
