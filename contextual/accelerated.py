@@ -76,6 +76,26 @@ def choose(probs):
 
 
 @njit(cache=True)
+def symmetric_pinv_solve(matrix, rhs):
+    """Solve a symmetric least-squares system using its Moore--Penrose inverse.
+
+    Online per-arm Gram matrices are rank deficient until an arm has received
+    enough linearly independent contexts.  Avoid ``np.linalg.solve`` here:
+    its singular-matrix exception is not reliably catchable inside Numba.
+    """
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+    scale = max(1.0, np.max(np.abs(eigenvalues)))
+    tolerance = np.finfo(np.float64).eps * matrix.shape[0] * scale
+    projected = eigenvectors.T @ rhs
+    for j in range(len(eigenvalues)):
+        if eigenvalues[j] > tolerance:
+            projected[j] /= eigenvalues[j]
+        else:
+            projected[j] = 0.0
+    return eigenvectors @ projected
+
+
+@njit(cache=True)
 def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, widths,
                   mix_weights, mix_means, mix_sds, env_code, logistic,
                   variance_code, floor, joint, policy_code, epsilon, prior_mean,
@@ -156,8 +176,7 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                 policy_means[a],cov[a]=posterior_update(policy_means[a],cov[a],x,reward,obs_var)
             elif policy_code==1:
                 gram[a]+=np.outer(x,x);info[a]+=x*reward;counts[a]+=1.
-                try:policy_means[a]=np.linalg.solve(gram[a],info[a])
-                except Exception:policy_means[a]=np.linalg.pinv(gram[a])@info[a]
+                policy_means[a]=symmetric_pinv_solve(gram[a],info[a])
             if checkpoint_index<n_checkpoints and t+1==checkpoints[checkpoint_index]:
                 observed[rep,checkpoint_index]=observed_sum/(t+1)
                 expected[rep,checkpoint_index]=expected_sum/(t+1)

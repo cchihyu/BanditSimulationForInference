@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 import numpy as np
 from scipy.stats import norm
-from contextual.accelerated import NUMBA_AVAILABLE, simulate, posterior_update, linear_ts_probabilities, linear_ts_action, rollout_block
+from contextual.accelerated import NUMBA_AVAILABLE, simulate, posterior_update, linear_ts_probabilities, linear_ts_action, rollout_block, symmetric_pinv_solve
 from contextual.algorithms import ContextualTSPolicy, ContextualEpsilonGreedyPolicy
 from contextual.simulation import UniformContextualPolicy, context_sampler, collect_subgaussian_data
 from contextual.subgaussian_environments import SubGaussianEnvironment
@@ -67,6 +67,21 @@ class CompiledTests(unittest.TestCase):
             a=regret_rollouts(env,target,context_sampler(0),8,500,seed=29,backend='numba')
             b=regret_rollouts(env,target,context_sampler(0),8,500,seed=29,backend='python')
             self.assertLessEqual(abs(a['value']-b['value']),6*np.hypot(a['value_se'],b['value_se'])+1e-10)
+
+    def test_epsilon_rollout_handles_rank_deficient_early_gram_matrices(self):
+        matrix=np.array([[1.,2.,3.],[2.,4.,6.],[3.,6.,9.]])
+        rhs=np.array([1.,2.,3.])
+        np.testing.assert_allclose(
+            symmetric_pinv_solve(matrix,rhs),np.linalg.pinv(matrix)@rhs,
+            atol=1e-10,rtol=1e-10)
+        env=SubGaussianEnvironment('scaled_bernoulli',np.array([
+            [.15,1.,-.75],[.15,1.,-.75],[.05,-.9,.95]]),scales=1.)
+        target=lambda seed:ContextualEpsilonGreedyPolicy(
+            3,2,epsilon=.1,reward_type='linear_gaussian',
+            explore_untried=False,seed=seed)
+        result=regret_rollouts(env,target,context_sampler(2),500,20,seed=2026,backend='numba')
+        self.assertTrue(np.isfinite(result['value']))
+        self.assertTrue(np.isfinite(result['regret']))
 
     def test_gradient_analytic_one_step(self):
         for kind in ['uniform','scaled_bernoulli']:
