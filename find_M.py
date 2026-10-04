@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rel_eps",
         type=float,
-        default=0.05,
+        default=0.1,
         help="Target relative half-width for the Monte Carlo error of the CI-width kernel.",
     )
     parser.add_argument("--seed", type=int, default=20260820)

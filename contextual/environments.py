@@ -30,6 +30,7 @@ class ContextualLinearGaussianRewardModel:
             raise ValueError("sigma must be positive.")
         self.n_actions = int(n_actions)
         self.context_dim = context_dim
+        self.sigma_fixed = sigma is not None
         self.sigma = None if sigma is None else float(sigma)
         self.adaptive_behavior = bool(adaptive_behavior)
         self.feature_map = feature_map
@@ -99,7 +100,7 @@ class ContextualLinearGaussianRewardModel:
             beta = np.linalg.pinv(lhs) @ rhs
 
         residuals = rewards - x_design @ beta
-        if self.sigma is None:
+        if not self.sigma_fixed:
             if self.adaptive_behavior:
                 sigma2 = float(
                     max(
@@ -115,7 +116,37 @@ class ContextualLinearGaussianRewardModel:
         else:
             sigma2 = self.sigma**2
 
-        if self.adaptive_behavior:
+        if not self.sigma_fixed:
+            beta_scores = (residuals[:, None] / sigma2) * x_design
+            eta_scores = -1.0 + residuals**2 / sigma2
+            score_rows = np.column_stack([beta_scores, eta_scores])
+
+            if self.adaptive_behavior:
+                h_beta_beta = ((x_design.T * estimating_weights) @ x_design) / (n_obs * sigma2)
+                h_beta_eta = (2.0 * (x_design.T @ (estimating_weights * residuals)) / (n_obs * sigma2))[:, None]
+                h_eta_beta = h_beta_eta.T
+                h_eta_eta = np.array(
+                    [[2.0 * np.sum(estimating_weights * residuals**2) / (n_obs * sigma2)]],
+                    dtype=np.float64,
+                )
+                h_hat = np.block([[h_beta_beta, h_beta_eta], [h_eta_beta, h_eta_eta]])
+                v_hat = (score_rows.T * (estimating_weights**2)) @ score_rows / n_obs
+                try:
+                    h_inv = np.linalg.inv(h_hat)
+                except np.linalg.LinAlgError:
+                    h_inv = np.linalg.pinv(h_hat)
+                Sigma = h_inv @ v_hat @ h_inv
+            else:
+                gram = (x_design.T @ x_design) / n_obs
+                try:
+                    gram_inv = np.linalg.inv(gram)
+                except np.linalg.LinAlgError:
+                    gram_inv = np.linalg.pinv(gram)
+                Sigma = np.zeros((n_params + 1, n_params + 1), dtype=np.float64)
+                Sigma[:n_params, :n_params] = sigma2 * gram_inv
+                Sigma[n_params, n_params] = 0.5
+            lambda_hat = np.concatenate([beta, [0.5 * np.log(sigma2)]])
+        elif self.adaptive_behavior:
             score_rows = (residuals[:, None] / sigma2) * x_design
             h_hat = ((x_design.T * estimating_weights) @ x_design) / (n_obs * sigma2)
             v_hat = (score_rows.T * (estimating_weights**2)) @ score_rows / n_obs
@@ -131,16 +162,18 @@ class ContextualLinearGaussianRewardModel:
             except np.linalg.LinAlgError:
                 gram_inv = np.linalg.pinv(gram)
             Sigma = sigma2 * gram_inv
+            lambda_hat = beta
 
-        self.lambda_hat_ = beta
+        self.lambda_hat_ = lambda_hat
         self.Sigma_ = Sigma
-        if self.sigma is None:
+        if not self.sigma_fixed:
             self.sigma = float(np.sqrt(sigma2))
-        return beta, Sigma
+        return lambda_hat, Sigma
 
     def mean(self, context: np.ndarray, action: int, params: np.ndarray | None = None) -> float:
-        params = self._params(params)
-        return float(self.features(context, action) @ params)
+        feat = self.features(context, action)
+        beta, _ = self._split_params(params, feat.shape[0])
+        return float(feat @ beta)
 
     def sample(
         self,
@@ -149,9 +182,9 @@ class ContextualLinearGaussianRewardModel:
         rng: np.random.Generator,
         params: np.ndarray | None = None,
     ) -> float:
-        if self.sigma is None:
-            raise RuntimeError("sigma is unknown; fit the model or provide sigma first.")
-        return float(rng.normal(self.mean(context, action, params=params), self.sigma))
+        feat = self.features(context, action)
+        _, sigma = self._split_params(params, feat.shape[0])
+        return float(rng.normal(self.mean(context, action, params=params), sigma))
 
     def score(
         self,
@@ -160,12 +193,14 @@ class ContextualLinearGaussianRewardModel:
         reward: float,
         params: np.ndarray | None = None,
     ) -> np.ndarray:
-        params = self._params(params)
-        if self.sigma is None:
-            raise RuntimeError("sigma is unknown; fit the model or provide sigma first.")
         feat = self.features(context, action)
-        residual = float(reward) - float(feat @ params)
-        return feat * residual / (self.sigma**2)
+        beta, sigma = self._split_params(params, feat.shape[0])
+        residual = float(reward) - float(feat @ beta)
+        beta_score = feat * residual / (sigma**2)
+        if self._params(params).shape[0] == feat.shape[0] + 1:
+            eta_score = -1.0 + residual**2 / (sigma**2)
+            return np.concatenate([beta_score, [eta_score]])
+        return beta_score
 
     def _params(self, params: np.ndarray | None) -> np.ndarray:
         if params is None:
@@ -173,6 +208,16 @@ class ContextualLinearGaussianRewardModel:
                 raise RuntimeError("Model parameters are unavailable; fit the model first.")
             return self.lambda_hat_
         return np.asarray(params, dtype=np.float64)
+
+    def _split_params(self, params: np.ndarray | None, n_beta: int) -> tuple[np.ndarray, float]:
+        arr = self._params(params)
+        if arr.shape[0] == n_beta:
+            if self.sigma is None:
+                raise RuntimeError("sigma is unknown; fit the model or provide sigma first.")
+            return arr, float(self.sigma)
+        if arr.shape[0] == n_beta + 1:
+            return arr[:n_beta], float(np.exp(arr[n_beta]))
+        raise ValueError(f"params must have length {n_beta} or {n_beta + 1}, got {arr.shape[0]}.")
 
 
 class ContextualLogisticBernoulliRewardModel:

@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--M_m0", type=int, default=1000)
     parser.add_argument("--M_bootstrap_reps", type=int, default=1000)
     parser.add_argument("--M_tau", type=float, default=0.05)
-    parser.add_argument("--M_rel_eps", type=float, default=0.05)
+    parser.add_argument("--M_rel_eps", type=float, default=0.1)
     parser.add_argument("--alpha", type=float, default=0.10)
     parser.add_argument("--n_actions", type=int, default=3)
     parser.add_argument("--context_dim", type=int, default=2)

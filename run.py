@@ -112,7 +112,7 @@ def build_parser():
     parser.add_argument("--M_m0", type=int, default=1000, help="Pilot rollouts used for automatic M selection.")
     parser.add_argument("--M_bootstrap_reps", type=int, default=1000, help="Bootstrap resamples used for automatic M selection.")
     parser.add_argument("--M_tau", type=float, default=0.05, help="Tail probability used for automatic M selection.")
-    parser.add_argument("--M_rel_eps", type=float, default=0.05, help="Target relative MC error used for automatic M selection.")
+    parser.add_argument("--M_rel_eps", type=float, default=0.1, help="Target relative MC error used for automatic M selection.")
     parser.add_argument("--estimate_sigma", action="store_true", default=False)
     # input variance estimation methods
     parser.add_argument( 
@@ -322,7 +322,7 @@ def finalize_args(args):
     if not hasattr(args, "M_tau"):
         args.M_tau = 0.05
     if not hasattr(args, "M_rel_eps"):
-        args.M_rel_eps = 0.05
+        args.M_rel_eps = 0.1
     if getattr(args, "infer_reps", None) is None:
         args.infer_reps = 200
     if not hasattr(args, "run_cadr_rescaled"):

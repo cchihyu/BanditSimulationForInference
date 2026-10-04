@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_actions", type=int, default=3)
     parser.add_argument("--epsilon_policy", type=float, default=0.1)
     parser.add_argument("--tau", type=float, default=0.05)
-    parser.add_argument("--rel_eps", type=float, default=0.05)
+    parser.add_argument("--rel_eps", type=float, default=0.1)
     parser.add_argument("--m0", type=int, default=1000)
     parser.add_argument("--B", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20260820)
@@ -91,17 +91,28 @@ def per_trajectory_gradients(reward_model, sim_result: dict, lambda_hat: np.ndar
     n_reps, T = actions.shape
     n_actions = reward_model.n_actions
     p = contexts.shape[2] + 1
-    beta = np.asarray(lambda_hat, dtype=np.float64).reshape(n_actions, p)
+    lambda_hat = np.asarray(lambda_hat, dtype=np.float64)
+    n_beta = n_actions * p
+    beta = lambda_hat[:n_beta].reshape(n_actions, p)
     x_design = np.concatenate(
         [np.ones((*contexts.shape[:2], 1), dtype=np.float64), contexts],
         axis=2,
     )
     future_returns = np.cumsum(rewards[:, ::-1], axis=1)[:, ::-1]
-    grads = np.zeros((n_reps, n_actions * p), dtype=np.float64)
+    grads = np.zeros((n_reps, lambda_hat.shape[0]), dtype=np.float64)
 
     if reward_model.__class__.__name__ == "ContextualLinearGaussianRewardModel":
+        sigma = (
+            float(np.exp(lambda_hat[n_beta]))
+            if lambda_hat.shape[0] == n_beta + 1
+            else float(reward_model.sigma)
+        )
         means = np.einsum("mtp,mtp->mt", x_design, beta[actions])
-        scale = (rewards - means) * future_returns / (T * float(reward_model.sigma) ** 2)
+        residuals = rewards - means
+        scale = residuals * future_returns / (T * sigma**2)
+        if lambda_hat.shape[0] == n_beta + 1:
+            eta_score = -1.0 + residuals**2 / (sigma**2)
+            grads[:, n_beta] = np.sum(eta_score * future_returns / T, axis=1)
     else:
         logits = np.einsum("mtp,mtp->mt", x_design, beta[actions])
         probs = expit(np.clip(logits, -35.0, 35.0))

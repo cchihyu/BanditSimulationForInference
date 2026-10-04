@@ -56,6 +56,20 @@ def default_params(
             )
         raise ValueError(f"Unknown environment {env!r}.")
 
+    if param_scenario == "natural":
+        if context_dim != 2:
+            raise ValueError("The natural parameter scenario is fixed only for context_dim=2.")
+        if env in {"linear_gaussian", "logistic_bernoulli"}:
+            return np.array(
+                [
+                    [0.10, 0.45, -0.35],
+                    [0.00, -0.40, 0.40],
+                    [-0.05, 0.20, 0.50],
+                ],
+                dtype=float,
+            ).reshape(-1)
+        raise ValueError(f"Unknown environment {env!r}.")
+
     if param_scenario != "default":
         raise ValueError(f"Unknown param_scenario {param_scenario!r}.")
     if context_dim != 2:

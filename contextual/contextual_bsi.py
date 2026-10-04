@@ -125,10 +125,17 @@ def contextual_bandit_exp_runner(
     is_linear = isinstance(reward_model, ContextualLinearGaussianRewardModel)
     is_logistic = isinstance(reward_model, ContextualLogisticBernoulliRewardModel)
     probe_policy = eval_policy_builder(algo_seed)
+    lambda_params = np.asarray(lambda_params, dtype=np.float64)
+    if is_linear and reward_model.feature_map is None:
+        linear_p = probe_policy.context_dim + 1
+        linear_n_beta = probe_policy.n_actions * linear_p
+        linear_sigma_available = reward_model.sigma is not None or lambda_params.shape[0] == linear_n_beta + 1
+    else:
+        linear_sigma_available = True
     can_vectorize_epsilon = (
         (is_linear or is_logistic)
         and reward_model.feature_map is None
-        and not (is_linear and reward_model.sigma is None)
+        and linear_sigma_available
         and isinstance(probe_policy, ContextualEpsilonGreedyPolicy)
         and probe_policy.reward_type == ("linear_gaussian" if is_linear else "logistic_bernoulli")
         and probe_policy.include_intercept
@@ -137,7 +144,7 @@ def contextual_bandit_exp_runner(
         os.environ.get("CONTEXTUAL_BSI_DISABLE_TS_VECTORIZE", "").lower() not in {"1", "true", "yes"}
         and (is_linear or is_logistic)
         and reward_model.feature_map is None
-        and not (is_linear and reward_model.sigma is None)
+        and linear_sigma_available
         and isinstance(probe_policy, ContextualTSPolicy)
         and probe_policy.reward_type == ("linear_gaussian" if is_linear else "logistic_bernoulli")
         and probe_policy.include_intercept
@@ -148,7 +155,8 @@ def contextual_bandit_exp_runner(
         context_dim = probe_policy.context_dim
         p = context_dim + 1
         lambda_params = np.asarray(lambda_params, dtype=np.float64)
-        if lambda_params.shape[0] == n_actions * p:
+        n_beta = n_actions * p
+        if lambda_params.shape[0] in {n_beta, n_beta + 1}:
             first_rng = np.random.default_rng(context_seed)
             first_contexts = _as_2d_contexts(context_sampler(first_rng, T))
             if first_contexts.shape != (T, context_dim):
@@ -169,7 +177,7 @@ def contextual_bandit_exp_runner(
             all_actions = np.zeros((n_reps, T), dtype=np.int64)
             all_rewards = np.zeros((n_reps, T), dtype=np.float64)
             all_probs = np.zeros((n_reps, T, n_actions), dtype=np.float64)
-            beta = lambda_params.reshape(n_actions, p)
+            beta = lambda_params[:n_beta].reshape(n_actions, p)
 
             action_rng = np.random.default_rng(algo_seed)
             policy_rng = np.random.default_rng(algo_seed + 1_000_003)
@@ -184,7 +192,11 @@ def contextual_bandit_exp_runner(
                     (n_reps, n_actions, p, p),
                 ).copy()
                 info = np.broadcast_to(prior_info, (n_reps, n_actions, p)).copy()
-                sigma = float(reward_model.sigma)
+                sigma = (
+                    float(np.exp(lambda_params[n_beta]))
+                    if lambda_params.shape[0] == n_beta + 1
+                    else float(reward_model.sigma)
+                )
             else:
                 coefs = np.zeros((n_reps, n_actions, p), dtype=np.float64)
                 covs = _logistic_ts_prior_cov(
@@ -319,7 +331,8 @@ def contextual_bandit_exp_runner(
         context_dim = probe_policy.context_dim
         p = context_dim + 1
         lambda_params = np.asarray(lambda_params, dtype=np.float64)
-        if lambda_params.shape[0] == n_actions * p:
+        n_beta = n_actions * p
+        if lambda_params.shape[0] in {n_beta, n_beta + 1}:
             first_rng = np.random.default_rng(context_seed)
             first_contexts = _as_2d_contexts(context_sampler(first_rng, T))
             if first_contexts.shape != (T, context_dim):
@@ -351,8 +364,12 @@ def contextual_bandit_exp_runner(
                 dirty_actions = np.full(n_reps, -1, dtype=np.int64)
 
             counts = np.zeros((n_reps, n_actions), dtype=np.int64)
-            beta = lambda_params.reshape(n_actions, p)
-            sigma = float(reward_model.sigma) if is_linear else None
+            beta = lambda_params[:n_beta].reshape(n_actions, p)
+            sigma = (
+                float(np.exp(lambda_params[n_beta]))
+                if is_linear and lambda_params.shape[0] == n_beta + 1
+                else (float(reward_model.sigma) if is_linear else None)
+            )
             action_rngs = [np.random.default_rng(algo_seed + rep) for rep in range(n_reps)]
             reward_rngs = [np.random.default_rng(context_seed + 100000 + rep) for rep in range(n_reps)]
 
@@ -572,18 +589,27 @@ def estimate_contextual_bsi_gradient(
     ):
         n_actions = reward_model.n_actions
         p = contexts.shape[2] + 1
-        if lambda_params.shape[0] == n_actions * p:
+        n_beta = n_actions * p
+        if lambda_params.shape[0] in {n_beta, n_beta + 1}:
             x_design = _add_policy_intercept(contexts)
-            beta = lambda_params.reshape(n_actions, p)
+            beta = lambda_params[:n_beta].reshape(n_actions, p)
+            sigma = (
+                float(np.exp(lambda_params[n_beta]))
+                if lambda_params.shape[0] == n_beta + 1
+                else float(reward_model.sigma)
+            )
             residuals = rewards - np.einsum("mtp,mtp->mt", x_design, beta[actions])
             future_returns = np.cumsum(rewards[:, ::-1], axis=1)[:, ::-1]
-            scale = residuals * future_returns / (T * float(reward_model.sigma) ** 2)
-            gradient = np.zeros(n_actions * p, dtype=np.float64)
+            scale = residuals * future_returns / (T * sigma**2)
+            gradient = np.zeros(lambda_params.shape[0], dtype=np.float64)
             for action in range(n_actions):
                 mask = actions == action
                 gradient[action * p : (action + 1) * p] = (
                     np.sum(x_design[mask] * scale[mask, None], axis=0) / n_reps
                 )
+            if lambda_params.shape[0] == n_beta + 1:
+                eta_score = -1.0 + residuals**2 / (sigma**2)
+                gradient[n_beta] = float(np.sum(eta_score * future_returns / T) / n_reps)
             return gradient
 
     if (
