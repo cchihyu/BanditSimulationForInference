@@ -428,7 +428,7 @@ class ContextualSubGaussianWorkingModel:
                  propagate_variance_uncertainty=False, variance_floor=1e-8,
                  proxy_alpha=.49, proxy_grid_size=4001, feature_map=None):
         from .dispersion import arm_values
-        if kind not in {'scaled_bernoulli','uniform','gaussian_mixture'}:
+        if kind not in {'scaled_bernoulli','uniform','gaussian_mixture','beta'}:
             raise ValueError('Unsupported environment')
         if variance_method not in {'empirical','variance_proxy','hoeffding'}:
             raise ValueError('Unknown variance method')

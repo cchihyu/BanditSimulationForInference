@@ -5,8 +5,9 @@ from .dispersion import arm_values
 
 
 class SubGaussianEnvironment:
-    def __init__(self, kind, beta, scales=1., half_widths=1., mixtures=None):
-        if kind not in {'scaled_bernoulli', 'gaussian_mixture', 'uniform'}:
+    def __init__(self, kind, beta, scales=1., half_widths=1., mixtures=None,
+                 beta_alphas=None, beta_betas=None):
+        if kind not in {'scaled_bernoulli', 'gaussian_mixture', 'uniform', 'beta'}:
             raise ValueError('Unsupported reward environment')
         self.kind = kind
         self.beta = np.asarray(beta, dtype=float)
@@ -16,6 +17,13 @@ class SubGaussianEnvironment:
         self.context_dim = p-1
         self.scales = arm_values(scales, self.n_actions, 'scales')
         self.half_widths = arm_values(half_widths, self.n_actions, 'half_widths')
+        self.beta_alphas = None if beta_alphas is None else arm_values(beta_alphas,self.n_actions,'beta alphas')
+        self.beta_betas = None if beta_betas is None else arm_values(beta_betas,self.n_actions,'beta betas')
+        if kind == 'beta':
+            if self.context_dim != 0 or self.beta_alphas is None or self.beta_betas is None:
+                raise ValueError('Beta rewards require context_dim=0 and per-arm alpha/beta parameters')
+            if np.any(self.beta_alphas <= 0) or np.any(self.beta_betas <= 0):
+                raise ValueError('Beta shape parameters must be positive')
         if mixtures is None:
             mixtures = [dict(weights=[.7,.3], means=[-.5, 7/6], sigmas=[.4,1.]) for _ in range(self.n_actions)]
         if len(mixtures) != self.n_actions:
@@ -30,6 +38,8 @@ class SubGaussianEnvironment:
             self.mixtures.append((w,m,s))
 
     def mean(self, x, a, params=None):
+        if self.kind == 'beta':
+            return float(self.beta_alphas[a]/(self.beta_alphas[a]+self.beta_betas[a]))
         eta = np.r_[1., x] @ self.beta[a]
         return float(self.scales[a]*expit(eta) if self.kind == 'scaled_bernoulli' else eta)
 
@@ -37,6 +47,8 @@ class SubGaussianEnvironment:
         mu = self.mean(x,a)
         if self.kind == 'scaled_bernoulli':
             return float(self.scales[a]*rng.binomial(1,mu/self.scales[a]))
+        if self.kind == 'beta':
+            return float(rng.beta(self.beta_alphas[a],self.beta_betas[a]))
         if self.kind == 'uniform':
             return float(mu+rng.uniform(-self.half_widths[a],self.half_widths[a]))
         w,m,s = self.mixtures[a]; j = rng.choice(len(w),p=w)
@@ -45,4 +57,5 @@ class SubGaussianEnvironment:
     def support_widths(self):
         if self.kind == 'gaussian_mixture':
             raise ValueError('Hoeffding is unavailable for unbounded Gaussian mixtures')
+        if self.kind == 'beta': return np.ones(self.n_actions)
         return self.scales if self.kind == 'scaled_bernoulli' else 2*self.half_widths

@@ -58,6 +58,15 @@ class CompiledTests(unittest.TestCase):
                 np.testing.assert_array_equal(a[key],b[key])
         self.assertTrue(rollout_block.nopython_signatures)
 
+    def test_compiled_beta_environment(self):
+        env=SubGaussianEnvironment('beta',np.array([[.35],[.5]]),
+                                   beta_alphas=[.35,.5],beta_betas=[.65,.5])
+        target=lambda seed:ContextualTSPolicy(2,0,obs_sigma=.5,n_prob_mc=20,seed=seed)
+        a=simulate(env,target,context_sampler(0),8,9,17,backend='numba',block_size=2)
+        b=simulate(env,target,context_sampler(0),8,9,17,backend='numba',block_size=5)
+        for key in ['observed','expected','regrets']:
+            np.testing.assert_array_equal(a[key],b[key])
+
     def test_reference_distribution(self):
         env=SubGaussianEnvironment('uniform',np.array([[.1],[-.2]]))
         for policy in ['ts','epsilon','uniform']:
@@ -201,8 +210,25 @@ class CompiledTests(unittest.TestCase):
         defaults=build_parser().parse_args([])
         self.assertTrue(defaults.include_baselines)
         self.assertTrue(defaults.include_elfcb)
+        self.assertFalse(defaults.baselines_only)
         disabled=build_parser().parse_args(['--no-include_baselines','--no-include_elfcb'])
         self.assertFalse(disabled.include_baselines)
         self.assertFalse(disabled.include_elfcb)
+
+    def test_baselines_only_skips_svi(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args=build_parser().parse_args([
+                '--baselines_only','--no-include_elfcb','--backend','python',
+                '--context_dim','0','--T_values','2','--T_offline_values','50',
+                '--offline_reps','1','--truth_reps','2','--inner_reps','1',
+                '--dr_bootstrap_reps','3','--no-progress','--save_path',
+                str(Path(tmp)/'baselines.json')])
+            payload=run(args)
+            self.assertEqual(payload['method'],'baselines_only')
+            self.assertEqual(payload['records'],[])
+            self.assertEqual(payload['summary'],[])
+            self.assertEqual(len(payload['baselines']),1)
+            self.assertTrue(payload['baseline_summary'])
+            self.assertTrue(Path(tmp,'baselines.csv').exists())
 
 if __name__=='__main__':unittest.main()

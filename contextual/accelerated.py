@@ -97,6 +97,7 @@ def symmetric_pinv_solve(matrix, rhs):
 
 @njit(cache=True)
 def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, widths,
+                  beta_alphas, beta_betas,
                   mix_weights, mix_means, mix_sds, env_code, logistic,
                   variance_code, floor, joint, policy_code, epsilon, prior_mean,
                   prior_var, obs_var, n_mc, pi_clip, explore_untried,
@@ -156,6 +157,8 @@ def rollout_block(contexts, seeds, beta, variance_beta, variances, scales, width
                 component=choose(mix_weights[a])
                 noise=mix_means[a,component]+mix_sds[a,component]*np.random.normal()
                 reward=mu+(np.sqrt(v)*noise if env_code==4 else noise)
+            elif env_code==5:
+                reward=np.random.beta(beta_alphas[a],beta_betas[a])
             else:reward=mu+np.sqrt(v)*np.random.normal()
             observed_sum+=reward
             if gradient_size>0:
@@ -219,13 +222,15 @@ def pack(environment, policy, params=None):
         code=4 if candidate else 0
     else:
         beta=model.beta;variance_beta=beta;variances=np.ones(k);widths=model.half_widths
-        code={'scaled_bernoulli':1,'uniform':2,'gaussian_mixture':3}[model.kind]
+        code={'scaled_bernoulli':1,'uniform':2,'gaussian_mixture':3,'beta':5}[model.kind]
         var_code=0;floor=1e-8;joint=False
     mixes=environment.mixtures if candidate else model.mixtures if true else [(np.ones(1),np.zeros(1),np.ones(1)) for _ in range(k)]
     components=max(len(w) for w,m,s in mixes)
     mw=np.zeros((k,components));mm=mw.copy();ms=np.ones_like(mw)
     for a,(w,m,s) in enumerate(mixes):mw[a,:len(w)]=w;mm[a,:len(w)]=m;ms[a,:len(w)]=s
-    numeric=[beta,variance_beta,variances,model.scales,widths,mw,mm,ms]
+    beta_alphas=model.beta_alphas if true and model.kind=='beta' else np.ones(k)
+    beta_betas=model.beta_betas if true and model.kind=='beta' else np.ones(k)
+    numeric=[beta,variance_beta,variances,model.scales,widths,beta_alphas,beta_betas,mw,mm,ms]
     numeric=[np.ascontiguousarray(x,dtype=np.float64) for x in numeric]
     n_mc=int(getattr(policy,'n_prob_mc',1))
     if n_mc<1:raise ValueError('ts_prob_mc must be positive')

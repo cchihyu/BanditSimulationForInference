@@ -12,12 +12,17 @@ from scipy.stats import f, norm, t
 
 
 @dataclass
-class ContextualBaselineIntervals:
+class BaselineIntervals:
     elfcb: tuple[float, float]
     ipw: tuple[float, float]
     weighted_t_test: tuple[float, float] | None
     cadr: tuple[float, float]
     dr: tuple[float, float]
+
+
+# Backward-compatible name.  MAB (zero context columns) and contextual
+# experiments use the same result type and estimator implementations.
+ContextualBaselineIntervals = BaselineIntervals
 
 
 class PerActionLinearRewardModel:
@@ -258,6 +263,24 @@ def contextual_cadr_sigmas_static(
     chosen=np.arange(len(rewards)),actions
     scores=target_probs[chosen]*rewards/behavior_probs[chosen]
     sigmas=np.full(len(rewards),warmup_sigma,dtype=float);running_sum=0.;running_sumsq=0.
+    for t,score in enumerate(scores):
+        if t>=min_samples:
+            variance=running_sumsq/t-(running_sum/t)**2
+            sigmas[t]=np.sqrt(max(float(variance),variance_floor))
+        running_sum+=score;running_sumsq+=score*score
+    return sigmas
+
+
+def sequential_score_sigmas(
+    scores, min_samples=30, variance_floor=1e-12, warmup_sigma=1.0,
+):
+    """Past-only running SDs for an arbitrary sequential score process."""
+    scores=np.asarray(scores,dtype=float)
+    if scores.ndim!=1 or not scores.size or np.any(~np.isfinite(scores)):
+        raise ValueError('scores must be a nonempty finite vector.')
+    if min_samples<1 or variance_floor<=0 or warmup_sigma<=0:
+        raise ValueError('Warm-up length and variance scales must be positive.')
+    sigmas=np.full(len(scores),warmup_sigma,dtype=float);running_sum=0.;running_sumsq=0.
     for t,score in enumerate(scores):
         if t>=min_samples:
             variance=running_sumsq/t-(running_sum/t)**2
@@ -646,6 +669,17 @@ def _call_policy_action_probs(
             except TypeError:
                 return eval_policy(context)
 
+    # Compatibility with the noncontextual algorithms in the repository.
+    # Their state is still replayed from the same logged actions and rewards;
+    # the sole interface difference is that they do not accept a context.
+    if hasattr(eval_policy, "select_action_with_probs"):
+        method = eval_policy.select_action_with_probs
+        try:
+            _, probs = method(n_samples=getattr(eval_policy, "n_prob_mc", 5000))
+        except TypeError:
+            _, probs = method()
+        return probs
+
     raise TypeError(
         "eval_policy must be callable or expose action_probs(context, history=...)."
     )
@@ -837,7 +871,7 @@ def contextual_dr_bootstrap_interval(
     return center - half_width, center + half_width
 
 
-def compute_all_contextual_intervals(
+def compute_all_intervals(
     contexts: np.ndarray,
     actions: np.ndarray,
     rewards: np.ndarray,
@@ -862,7 +896,13 @@ def compute_all_contextual_intervals(
     allow_adaptive_cadr: bool = False,
     cadr_behavior_is_static: bool = False,
     include_cadr: bool = True,
-) -> ContextualBaselineIntervals:
+) -> BaselineIntervals:
+    """Compute one shared set of OPE baselines for MAB or contextual logs.
+
+    ``contexts`` must have shape ``(n, d)``.  Passing ``d=0`` is the MAB
+    case; no estimator, weighting rule, confidence interval, or adaptive
+    logging calculation changes when context columns are absent.
+    """
     contexts, actions, rewards, behavior_probs = _validate_contextual_inputs(
         contexts, actions, rewards, behavior_probs
     )
@@ -907,14 +947,16 @@ def compute_all_contextual_intervals(
     )
     if dr_ci_method not in {"bootstrap", "wald"}:
         raise ValueError("dr_ci_method must be bootstrap or wald.")
-    if weight_mode != "one_step":
-        raise ValueError("DR/CADR wrapper supports one_step only; cumulative weights require sequential inference.")
     cadr = (float("nan"), float("nan"))
     if include_cadr:
         if not cadr_target_is_fixed and not allow_adaptive_cadr:
             raise ValueError("Set allow_adaptive_cadr=True to compute adaptive-target CADR.")
         if cadr_conditional_sigmas is None:
-            if cadr_behavior_is_static:
+            if weight_mode == "cumulative":
+                cadr_conditional_sigmas=sequential_score_sigmas(
+                    weights*rewards,cadr_min_samples,cadr_variance_floor,
+                    cadr_warmup_sigma)
+            elif cadr_behavior_is_static:
                 cadr_conditional_sigmas=contextual_cadr_sigmas_static(
                     actions,rewards,behavior_probs,pi_hist,cadr_min_samples,
                     cadr_variance_floor,cadr_warmup_sigma)
@@ -941,10 +983,32 @@ def compute_all_contextual_intervals(
         reward_model=reward_model,
         **dr_options,
     )
-    return ContextualBaselineIntervals(
+    return BaselineIntervals(
         elfcb=elfcb,
         ipw=ipw,
         weighted_t_test=weighted_t_test,
         cadr=cadr,
         dr=dr,
     )
+
+
+def compute_all_bandit_intervals(
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    behavior_probs: np.ndarray,
+    eval_policy: Any,
+    conf_level: float,
+    **kwargs,
+) -> BaselineIntervals:
+    """MAB convenience wrapper around the shared contextual implementation."""
+    actions = np.asarray(actions)
+    contexts = np.empty((len(actions), 0), dtype=np.float64)
+    return compute_all_intervals(
+        contexts, actions, rewards, behavior_probs, eval_policy, conf_level,
+        **kwargs,
+    )
+
+
+# Existing callers retain the old public name, but it is no longer a separate
+# contextual implementation.
+compute_all_contextual_intervals = compute_all_intervals

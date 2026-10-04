@@ -38,6 +38,10 @@ is not included.
   and `sigmas`. Component offsets are centered automatically; shape parameters do
   not depend on context. For two arms, for example:
   `--mixtures_json '[{"weights":[0.7,0.3],"means":[-1,2],"sigmas":[0.3,0.8]},{"weights":[1],"means":[0],"sigmas":[1]}]'`.
+* `beta`: intercept-only MAB rewards. Use `--context_dim 0` and supply one positive
+  shape per arm through `--beta_alphas` and `--beta_betas`. The conditional arm
+  means are computed as `alpha/(alpha+beta)` and are fitted by the Gaussian SVI
+  working model; the true rollouts sample the specified Beta distributions.
 
 ### Dispersion and uncertainty
 
@@ -108,7 +112,8 @@ B_T/T. An empirical variance used as a proxy budget is an additional approximati
 ### Results and baselines
 
 JSON contains configuration, independent true-value MC estimates and SEs, per-run
-parameters/covariances/gradients, fitted dispersion, base and corrected intervals,
+parameters/covariances/gradients, fitted dispersion, SVI and projection-SVI intervals,
+both regret-corrected versions,
 regret diagnostics, and summaries. A companion CSV contains SVI coverage, width,
 and bias summaries. Primary SVI intervals are Wald for uniform logging and projection
 for adaptive logging. Reported coverage treats the independently simulated truth as
@@ -116,8 +121,9 @@ its reference; inspect its SE. SVI center MC error is recorded, not added to the
 Finite-search and plug-in corrections do not guarantee nominal coverage.
 
 At completion, the runner also prints the truth estimate, successful and failed
-replication counts, base and corrected coverage, coverage MC SE, mean center and bias,
-base and corrected widths, mean endpoint correction, and all saved-file paths. Output
+replication counts, coverage and width for SVI, projection SVI, corrected SVI, and
+corrected projection SVI, plus mean center, bias, endpoint correction, baseline
+results, and all saved-file paths. Output
 continues to appear in the terminal when piped through `tee` and is copied to the log.
 
 `--select_M` enables existing gradient-pilot replication selection, with controls
@@ -126,6 +132,11 @@ width stability, not center MC error. Capped selections are recorded.
 
 IPW, bootstrap DR, and ELF-CB baselines run by default. Use `--no-include_baselines`
 for an SVI-only diagnostic run, or `--no-include_elfcb` to omit ELF-CB. The option
+`--baselines_only` runs baseline coverage without fitting SVI models, selecting (M),
+performing inner SVI simulations, or calculating regret corrections. The JSON and
+checkpoint retain baseline replication details, and the companion CSV contains the
+baseline coverage and width summary.
+The option
 `--dr_ci_method wald` replaces bootstrap DR. Set `--dr_bootstrap_reps`; bootstrap
 seeds derive reproducibly from the run seed. Scaled Bernoulli DR fits logistic
 probabilities on rewards divided by scale.
@@ -138,6 +149,12 @@ require O(n^2) work. CADR warm-up and floors have dedicated flags. ELF-CB uses
 observed extrema, not certified population support bounds. Missing
 intervals are JSON null; bootstrap fit failures raise rather than being discarded.
 CADR snapshots and transport can require O(n^2) time/storage for growing logging policies.
+
+All baseline estimators are implemented once in `contextual/baselines.py`.
+`compute_all_intervals` accepts contextual logs of shape `(n, d)`, while
+`compute_all_bandit_intervals` supplies an `(n, 0)` context matrix to that same
+implementation. Both entry points replay adaptive target policies against the logged
+history and support identical `one_step` and `cumulative` importance-ratio modes.
 
 ## Existing runner and validation
 

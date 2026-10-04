@@ -6,12 +6,12 @@ from scipy.stats import norm
 from contextual.dispersion import bernoulli_proxy, residual_proxy
 from contextual.subgaussian_environments import SubGaussianEnvironment
 from contextual.environments import ContextualSubGaussianWorkingModel, ContextualLinearGaussianRewardModel
-from contextual.simulation import context_sampler, collect_subgaussian_data, UniformContextualPolicy
+from contextual.simulation import context_sampler, collect_subgaussian_data, UniformContextualPolicy, ContextualEpsilonGreedyPolicy, ContextualTSPolicy
 from contextual.regret_corrections import regret_rollouts, search_mixture_regret, expand_interval, standardized_mixture
 from contextual.contextual_bsi import ContextualParametricSVI, ContextualParametricBSI, contextual_bandit_exp_runner, estimate_contextual_svi_gradient
 from contextual.select_inner_reps import per_trajectory_gradients
 from contextual.run_subgaussian import build_parser,run
-from contextual.baselines import cadr_interval, contextual_cadr_sigmas, contextual_cadr_sigmas_static, contextual_dr_bootstrap_interval, PerActionLinearRewardModel
+from contextual.baselines import cadr_interval, contextual_cadr_sigmas, contextual_cadr_sigmas_static, contextual_dr_bootstrap_interval, PerActionLinearRewardModel, compute_all_intervals, compute_all_bandit_intervals
 
 
 class SubGaussianTests(unittest.TestCase):
@@ -47,6 +47,10 @@ class SubGaussianTests(unittest.TestCase):
             if kind=='uniform': self.assertLess(abs(ys.var()-1/3),.025)
             if kind=='scaled_bernoulli':
                 p=env.mean([],0)/2;self.assertLess(abs(ys.var()-4*p*(1-p)),.025)
+        env=SubGaussianEnvironment('beta',np.array([[.35]]),beta_alphas=[.35],beta_betas=[.65])
+        ys=np.array([env.sample(np.empty(0),0,rng) for _ in range(15000)])
+        self.assertLess(abs(ys.mean()-.35),.015)
+        self.assertAlmostEqual(env.support_widths()[0],1.)
 
     def test_scores_finite_difference(self):
         for kind in ['uniform','gaussian_mixture','scaled_bernoulli']:
@@ -126,6 +130,30 @@ class SubGaussianTests(unittest.TestCase):
         width=norm.ppf(.975)*np.std(samples)
         np.testing.assert_allclose(ci,[y.mean()-width,y.mean()+width])
 
+    def test_mab_and_zero_context_use_identical_baselines(self):
+        env=SubGaussianEnvironment('uniform',np.array([[.1],[-.2]]))
+        behavior=lambda seed:ContextualEpsilonGreedyPolicy(
+            2,0,epsilon=.2,reward_type='linear_gaussian',
+            explore_untried=False,seed=seed)
+        data,current=collect_subgaussian_data(
+            env,behavior,context_sampler(0),80,37,retain_policy_states=True)
+        target=lambda seed:ContextualTSPolicy(2,0,n_prob_mc=20,seed=seed)
+        options=dict(
+            reward_model=PerActionLinearRewardModel(),include_elfcb=False,
+            dr_bootstrap_reps=20,dr_bootstrap_seed=91,
+            cadr_current_behavior_probs=current,cadr_min_samples=5,
+            cadr_target_is_fixed=False,allow_adaptive_cadr=True,
+            cadr_behavior_is_static=False)
+        for mode in ('one_step','cumulative'):
+            contextual=compute_all_intervals(
+                data['contexts'],data['actions'],data['rewards'],
+                data['behavior_probs'],target(73),.9,weight_mode=mode,**options)
+            bandit=compute_all_bandit_intervals(
+                data['actions'],data['rewards'],data['behavior_probs'],
+                target(73),.9,weight_mode=mode,**options)
+            for name in ('ipw','dr','cadr'):
+                np.testing.assert_allclose(getattr(contextual,name),getattr(bandit,name))
+
     def test_runner_matrix(self):
         with tempfile.TemporaryDirectory() as tmp:
             for env in ['uniform','scaled_bernoulli','gaussian_mixture']:
@@ -136,6 +164,16 @@ class SubGaussianTests(unittest.TestCase):
                     '--proxy_grid_size','101','--variance_methods',*methods,'--regret_methods','gaussian_mixture_search','minimax_bound',
                     '--no-include_baselines','--save_path',str(Path(tmp)/f'{env}.json')])
                 payload=run(args);self.assertEqual(len(payload['records']),len(methods)*2)
+            args=build_parser().parse_args(['--env','beta','--beta_alphas','.35','.5','.5',
+                '--beta_betas','.65','.5','.5','--n_actions','3','--context_dim','0',
+                '--T_values','2','--T_offline_values','100','--offline_reps','1','--inner_reps','4',
+                '--truth_reps','4','--variance_methods','hoeffding','empirical',
+                '--regret_methods','minimax_bound','--no-include_baselines',
+                '--save_path',str(Path(tmp)/'beta.json')])
+            payload=run(args)
+            record=payload['records'][0]
+            for name in ('svi','projection_svi','corrected_svi','corrected_projection_svi'):
+                self.assertIn(name,record)
             args=build_parser().parse_args(['--env','uniform','--n_actions','2','--context_dim','1',
                 '--pi0','contextual_epsilon','--pi1','uniform','--propagate_variance_uncertainty',
                 '--T_values','2','--T_offline_values','100','--offline_reps','1','--inner_reps','4','--truth_reps','4',

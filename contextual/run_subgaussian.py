@@ -17,7 +17,7 @@ from .contextual_bsi import ContextualParametricSVI, contextual_bandit_exp_runne
 from .select_inner_reps import per_trajectory_gradients, estimate_m_from_pilot
 from .regret_corrections import search_mixture_regret_horizons, minimax_type_regret, regret_rollouts_horizons, expand_interval
 from .run_contextual import to_serializable
-from .baselines import compute_all_contextual_intervals, PerActionLinearRewardModel, PerActionLogisticRewardModel
+from .baselines import compute_all_intervals, PerActionLinearRewardModel, PerActionLogisticRewardModel
 
 
 class ScaledBernoulliBaselineModel:
@@ -30,13 +30,15 @@ class ScaledBernoulliBaselineModel:
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--env',choices=['scaled_bernoulli','gaussian_mixture','uniform'],default='uniform')
+    p.add_argument('--env',choices=['scaled_bernoulli','gaussian_mixture','uniform','beta'],default='uniform')
     p.add_argument('--n_actions',type=int,default=3)
     p.add_argument('--context_dim',type=int,default=2)
     p.add_argument('--context_var',type=float,default=1.)
     p.add_argument('--beta',type=float,nargs='+',help='Action-major conditional-mean coefficients; logits for Bernoulli')
     p.add_argument('--scales',type=float,nargs='+',default=[1.])
     p.add_argument('--half_widths',type=float,nargs='+',default=[1.])
+    p.add_argument('--beta_alphas',type=float,nargs='+',help='Per-arm Beta alpha shapes (MAB only)')
+    p.add_argument('--beta_betas',type=float,nargs='+',help='Per-arm Beta beta shapes (MAB only)')
     p.add_argument('--mixtures_json',help='List of per-arm weights, means, sigmas; offsets are centered automatically')
     p.add_argument('--variance_methods',nargs='+',choices=['hoeffding','variance_proxy','empirical'],default=['empirical'])
     p.add_argument('--propagate_variance_uncertainty',action=argparse.BooleanOptionalAction,default=False)
@@ -76,6 +78,8 @@ def build_parser():
     p.add_argument('--bound_log',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--include_baselines',action=argparse.BooleanOptionalAction,default=True,
                    help='Run IPW, DR, and supported CADR baselines (default: enabled)')
+    p.add_argument('--baselines_only',action='store_true',
+                   help='Run baseline coverage only; skip SVI, M selection, and regret corrections')
     p.add_argument('--include_elfcb',action=argparse.BooleanOptionalAction,default=True,
                    help='Run ELF-CB with the other baselines (default: enabled)')
     p.add_argument('--dr_ci_method',choices=['bootstrap','wald'],default='bootstrap')
@@ -113,7 +117,8 @@ def _replication_task(task):
     args,beta,n,rep,truth=task
     records=[]; baseline_records=[]
     env = SubGaussianEnvironment(args.env,beta,args.scales,args.half_widths,
-                                 None if args.mixtures_json is None else json.loads(args.mixtures_json))
+                                 None if args.mixtures_json is None else json.loads(args.mixtures_json),
+                                 args.beta_alphas,args.beta_betas)
     sampler = context_sampler(args.context_dim,args.context_var)
     behavior = policy_builder(args,args.pi0,args.epsilon0)
     target = policy_builder(args,args.pi1,args.epsilon1)
@@ -122,17 +127,23 @@ def _replication_task(task):
         retain_policy_states=args.include_baselines and args.pi0 != 'uniform')
     if args.include_baselines:
         model = ScaledBernoulliBaselineModel(env.scales) if args.env == 'scaled_bernoulli' else PerActionLinearRewardModel()
-        base = compute_all_contextual_intervals(
-            offline['contexts'],offline['actions'],offline['rewards'],offline['behavior_probs'],
-            target(seed+1),1-args.alpha,reward_model=model,include_elfcb=args.include_elfcb,
-            dr_ci_method=args.dr_ci_method,dr_bootstrap_reps=args.dr_bootstrap_reps,
-            dr_bootstrap_seed=seed+2,include_cadr=True,
-            cadr_current_behavior_probs=callback,cadr_min_samples=args.cadr_min_samples,
-            cadr_variance_floor=args.cadr_variance_floor,cadr_warmup_sigma=args.cadr_warmup_sigma,
-            cadr_target_is_fixed=args.pi1 == 'uniform',allow_adaptive_cadr=True,
-            cadr_behavior_is_static=args.pi0 == 'uniform')
-        baseline_records.append(dict(n=n,rep=rep,intervals=vars(base),
-            target_interpretation='fixed contextual target' if args.pi1 == 'uniform' else 'adaptive contextual target'))
+        for T in args.T_values:
+            horizon=min(T,n)
+            base = compute_all_intervals(
+                offline['contexts'][:horizon],offline['actions'][:horizon],
+                offline['rewards'][:horizon],offline['behavior_probs'][:horizon],
+                target(seed+1),1-args.alpha,reward_model=model,include_elfcb=args.include_elfcb,
+                dr_ci_method=args.dr_ci_method,dr_bootstrap_reps=args.dr_bootstrap_reps,
+                dr_bootstrap_seed=seed+2+T,include_cadr=True,
+                cadr_current_behavior_probs=callback,cadr_min_samples=args.cadr_min_samples,
+                cadr_variance_floor=args.cadr_variance_floor,cadr_warmup_sigma=args.cadr_warmup_sigma,
+                cadr_target_is_fixed=args.pi1 == 'uniform',allow_adaptive_cadr=True,
+                cadr_behavior_is_static=args.pi0 == 'uniform')
+            baseline_records.append(dict(n=n,rep=rep,T=T,evaluation_horizon=horizon,
+                intervals=vars(base),target_interpretation='fixed contextual target'
+                if args.pi1 == 'uniform' else 'adaptive contextual target'))
+    if args.baselines_only:
+        return records, baseline_records
     for method in args.variance_methods:
         model = ContextualSubGaussianWorkingModel(args.n_actions,args.context_dim,args.env,method,
             scales=env.scales,support_widths=None if args.env == 'gaussian_mixture' else env.support_widths(),
@@ -168,14 +179,25 @@ def _replication_task(task):
                 else:
                     proxy=max(env.scales**2/4) if args.env == 'scaled_bernoulli' else max(model.variances)
                     reg=minimax_type_regret(T,args.n_actions,model.p,proxy,args.bound_constant,args.bound_formula,args.bound_log)
-                corrected=expand_interval(primary,reg['B_T'],T)
+                corrected_svi=expand_interval(wald,reg['B_T'],T)
+                corrected_projection_svi=expand_interval(proj,reg['B_T'],T)
+                corrected=corrected_svi if args.pi0 == 'uniform' else corrected_projection_svi
+                target_value=truth[T]['value']
                 records.append(dict(n=n,rep=rep,T=T,variance_method=method,regret_method=correction,
                     center=result.center,center_mc_se=result.center_se,lambda_hat=result.lambda_hat,Sigma=result.Sigma,
                     gradient=result.gradient,simulation_backend=result.pi1_img.get('backend','python'),dispersion=model.variances if model.variances is not None else dict(type='conditional Bernoulli',beta=model.frozen_beta,scales=model.scales),
                     variance_uncertainty_propagated=model.propagate,primary_type='wald' if args.pi0 == 'uniform' else 'projection',
-                    wald=wald,projection=proj,base=primary,corrected=corrected,regret=reg,inner_reps=M,selected_M=m_info,
-                    bias=result.center-truth[T]['value'],covered=corrected[0]<=truth[T]['value']<=corrected[1],
-                    base_covered=primary[0]<=truth[T]['value']<=primary[1],width=corrected[1]-corrected[0]))
+                    wald=wald,projection=proj,base=primary,corrected=corrected,
+                    svi=wald,projection_svi=proj,corrected_svi=corrected_svi,
+                    corrected_projection_svi=corrected_projection_svi,
+                    regret=reg,inner_reps=M,selected_M=m_info,
+                    bias=result.center-target_value,covered=corrected[0]<=target_value<=corrected[1],
+                    base_covered=primary[0]<=target_value<=primary[1],
+                    svi_covered=wald[0]<=target_value<=wald[1],
+                    projection_svi_covered=proj[0]<=target_value<=proj[1],
+                    corrected_svi_covered=corrected_svi[0]<=target_value<=corrected_svi[1],
+                    corrected_projection_svi_covered=corrected_projection_svi[0]<=target_value<=corrected_projection_svi[1],
+                    width=corrected[1]-corrected[0]))
     return records, baseline_records
 
 
@@ -191,7 +213,8 @@ def _safe_replication_task(task):
 def _truth_task(task):
     args,beta,start,count=task
     env = SubGaussianEnvironment(args.env,beta,args.scales,args.half_widths,
-                                 None if args.mixtures_json is None else json.loads(args.mixtures_json))
+                                 None if args.mixtures_json is None else json.loads(args.mixtures_json),
+                                 args.beta_alphas,args.beta_betas)
     sampler = context_sampler(args.context_dim,args.context_var)
     behavior = policy_builder(args,args.pi0,args.epsilon0)
     target = policy_builder(args,args.pi1,args.epsilon1)
@@ -222,20 +245,38 @@ def _map_tasks(function,tasks,args,description):
 def run(args):
     if args.n_actions < 1 or args.context_dim < 0 or not 0 < args.alpha < 1:
         raise ValueError('Invalid dimensions or alpha')
-    if min(args.T_values+args.T_offline_values+[args.offline_reps]) < 1 or min(args.inner_reps,args.truth_reps) < 2:
-        raise ValueError('Positive sample sizes and >=2 simulation replicates required')
-    if args.env == 'gaussian_mixture' and 'hoeffding' in args.variance_methods:
+    if min(args.T_values+args.T_offline_values+[args.offline_reps]) < 1 or args.truth_reps < 2:
+        raise ValueError('Positive sample sizes and at least 2 truth replicates required')
+    if args.baselines_only and not args.include_baselines:
+        raise ValueError('--baselines_only cannot be combined with --no-include_baselines')
+    if not args.baselines_only and args.inner_reps < 2:
+        raise ValueError('SVI requires at least 2 inner simulation replicates')
+    if not args.baselines_only and args.env == 'gaussian_mixture' and 'hoeffding' in args.variance_methods:
         raise ValueError('Hoeffding is unavailable for Gaussian mixtures')
-    if args.select_M and min(args.M_pilot,args.M_bootstrap_reps,args.Mmax) < 2:
+    if not args.baselines_only and args.select_M and min(args.M_pilot,args.M_bootstrap_reps,args.Mmax) < 2:
         raise ValueError('Pilot, bootstrap and M budget must each be >=2')
-    if args.propagate_variance_uncertainty and 'variance_proxy' in args.variance_methods:
+    if not args.baselines_only and args.propagate_variance_uncertainty and 'variance_proxy' in args.variance_methods:
         raise ValueError('Proxy uncertainty is unsupported; select empirical or Hoeffding')
-    beta = np.zeros((args.n_actions,args.context_dim+1))
-    beta[:,0] = np.linspace(-.5,.5,args.n_actions)
-    if args.context_dim: beta[:,1:] = np.linspace(-.3,.3,args.n_actions)[:,None]
-    if args.beta is not None: beta = np.asarray(args.beta).reshape(beta.shape)
+    if args.env == 'beta':
+        if args.context_dim != 0:
+            raise ValueError('Beta rewards are an MAB environment; use --context_dim 0')
+        if args.beta_alphas is None or args.beta_betas is None:
+            raise ValueError('Beta rewards require --beta_alphas and --beta_betas')
+        if len(args.beta_alphas) != args.n_actions or len(args.beta_betas) != args.n_actions:
+            raise ValueError('Supply one Beta alpha and beta shape for every arm')
+        if args.beta is not None:
+            raise ValueError('--beta coefficients are not used by the Beta MAB environment')
+        alpha_shapes=np.asarray(args.beta_alphas,dtype=float)
+        beta_shapes=np.asarray(args.beta_betas,dtype=float)
+        beta=(alpha_shapes/(alpha_shapes+beta_shapes))[:,None]
+    else:
+        beta = np.zeros((args.n_actions,args.context_dim+1))
+        beta[:,0] = np.linspace(-.5,.5,args.n_actions)
+        if args.context_dim: beta[:,1:] = np.linspace(-.3,.3,args.n_actions)[:,None]
+        if args.beta is not None: beta = np.asarray(args.beta).reshape(beta.shape)
     env = SubGaussianEnvironment(args.env,beta,args.scales,args.half_widths,
-                                 None if args.mixtures_json is None else json.loads(args.mixtures_json))
+                                 None if args.mixtures_json is None else json.loads(args.mixtures_json),
+                                 args.beta_alphas,args.beta_betas)
     sampler = context_sampler(args.context_dim,args.context_var)
     behavior = policy_builder(args,args.pi0,args.epsilon0)
     target = policy_builder(args,args.pi1,args.epsilon1)
@@ -250,6 +291,8 @@ def run(args):
         raise ValueError('truth_batch_size must be positive')
     truth_spec=dict(env=args.env,beta=beta.tolist(),scales=np.asarray(env.scales).tolist(),
         half_widths=np.asarray(env.half_widths).tolist(),mixtures=args.mixtures_json,
+        beta_alphas=None if env.beta_alphas is None else env.beta_alphas.tolist(),
+        beta_betas=None if env.beta_betas is None else env.beta_betas.tolist(),
         context_dim=args.context_dim,context_var=args.context_var,pi1=args.pi1,
         epsilon1=args.epsilon1,obs_sigma=args.obs_sigma,ts_prob_mc=args.ts_prob_mc,
         horizons=sorted(set(args.T_values)),truth_reps=args.truth_reps,seed=args.seed,
@@ -299,10 +342,10 @@ def run(args):
             else:
                 records.extend(outcome['records']);baseline_records.extend(outcome['baselines'])
     records.sort(key=lambda r:(r['n'],r['rep'],r['T'],r['variance_method'],r['regret_method']))
-    baseline_records.sort(key=lambda r:(r['n'],r['rep']))
+    baseline_records.sort(key=lambda r:(r['n'],r['T'],r['rep']))
     failures.sort(key=lambda r:(r['n'],r['rep']))
     summaries=[]
-    for n in args.T_offline_values:
+    for n in ([] if args.baselines_only else args.T_offline_values):
         for T in args.T_values:
             for method in args.variance_methods:
                 for correction in args.regret_methods:
@@ -313,7 +356,15 @@ def run(args):
                         successful_reps=len(group),failed_reps=args.offline_reps-len(group),
                         coverage_all_requested=float(sum(r['covered'] for r in group)/args.offline_reps),
                         base_coverage=float(np.mean([r['base_covered'] for r in group])) if group else float('nan'),
+                        svi_coverage=float(np.mean([r['svi_covered'] for r in group])) if group else float('nan'),
+                        projection_svi_coverage=float(np.mean([r['projection_svi_covered'] for r in group])) if group else float('nan'),
+                        corrected_svi_coverage=float(np.mean([r['corrected_svi_covered'] for r in group])) if group else float('nan'),
+                        corrected_projection_svi_coverage=float(np.mean([r['corrected_projection_svi_covered'] for r in group])) if group else float('nan'),
                         mean_center=float(np.mean([r['center'] for r in group])) if group else float('nan'),
+                        mean_svi_width=float(np.mean([r['svi'][1]-r['svi'][0] for r in group])) if group else float('nan'),
+                        mean_projection_svi_width=float(np.mean([r['projection_svi'][1]-r['projection_svi'][0] for r in group])) if group else float('nan'),
+                        mean_corrected_svi_width=float(np.mean([r['corrected_svi'][1]-r['corrected_svi'][0] for r in group])) if group else float('nan'),
+                        mean_corrected_projection_svi_width=float(np.mean([r['corrected_projection_svi'][1]-r['corrected_projection_svi'][0] for r in group])) if group else float('nan'),
                         mean_base_width=float(np.mean([r['base'][1]-r['base'][0] for r in group])) if group else float('nan'),
                         mean_correction=float(np.mean([r['regret']['B_T']/T for r in group])) if group else float('nan'),
                         mean_width=float(np.mean([r['width'] for r in group])) if group else float('nan'),
@@ -321,29 +372,44 @@ def run(args):
     baseline_results=baseline_summary(baseline_records,truth)
     payload=dict(config=vars(args),true_beta=beta,truth=truth,records=records,summary=summaries,baselines=baseline_records,failures=failures,checkpoint=str(checkpoint),
         baseline_summary=baseline_results,
-        method='SVI',qualification='Empirical corrections with plug-in parameters; no certified worst-case coverage guarantee',
+        method='baselines_only' if args.baselines_only else 'SVI',
+        qualification=None if args.baselines_only else 'Empirical corrections with plug-in parameters; no certified worst-case coverage guarantee',
         context_distribution='known Gaussian',policy_model='linear working learner on every reward environment')
     args.save_path.parent.mkdir(parents=True,exist_ok=True)
     args.save_path.write_text(json.dumps(clean_json(to_serializable(payload)),indent=2,allow_nan=False))
     import csv
+    csv_rows=baseline_results if args.baselines_only else summaries
     with args.save_path.with_suffix('.csv').open('w',newline='') as f:
-        writer=csv.DictWriter(f,fieldnames=list(summaries[0]));writer.writeheader();writer.writerows(clean_json(summaries))
-    print_terminal_summary(truth,summaries,baseline_results,args.save_path,checkpoint)
+        if csv_rows:
+            writer=csv.DictWriter(f,fieldnames=list(csv_rows[0]));writer.writeheader();writer.writerows(clean_json(csv_rows))
+    print_terminal_summary(truth,summaries,baseline_results,args.save_path,checkpoint,args.baselines_only)
     return payload
 
 
-def print_terminal_summary(truth, summaries, baseline_results, save_path, checkpoint):
-    print('\n=== Contextual SVI coverage results ===')
+def print_terminal_summary(truth, summaries, baseline_results, save_path, checkpoint, baselines_only=False):
+    print('\n=== Baseline-only coverage results ===' if baselines_only else '\n=== Contextual SVI coverage results ===')
     for T in sorted(truth):
         item=truth[T]
         print(f"Truth T={T}: value={item['value']:.6f}, MC SE={item['value_se']:.6f}")
     for item in summaries:
+        svi_coverage=item.get('svi_coverage',item['base_coverage'])
+        projection_coverage=item.get('projection_svi_coverage',item['base_coverage'])
+        corrected_svi_coverage=item.get('corrected_svi_coverage',item['coverage'])
+        corrected_projection_coverage=item.get('corrected_projection_svi_coverage',item['coverage'])
+        svi_width=item.get('mean_svi_width',item['mean_base_width'])
+        projection_width=item.get('mean_projection_svi_width',item['mean_base_width'])
+        corrected_svi_width=item.get('mean_corrected_svi_width',item['mean_width'])
+        corrected_projection_width=item.get('mean_corrected_projection_svi_width',item['mean_width'])
         print(
             f"T_offline={item['n']}, T={item['T']}, variance={item['variance_method']}, "
             f"correction={item['regret_method']}\n"
             f"  successful={item['successful_reps']}, failed={item['failed_reps']}\n"
-            f"  base coverage={item['base_coverage']:.4f}, corrected coverage={item['coverage']:.4f}, "
-            f"coverage MC SE={item['coverage_mc_se']:.4f}\n"
+            f"  SVI: coverage={svi_coverage:.4f}, mean width={svi_width:.6f}\n"
+            f"  projection SVI: coverage={projection_coverage:.4f}, mean width={projection_width:.6f}\n"
+            f"  corrected SVI: coverage={corrected_svi_coverage:.4f}, mean width={corrected_svi_width:.6f}\n"
+            f"  corrected projection SVI: coverage={corrected_projection_coverage:.4f}, mean width={corrected_projection_width:.6f}\n"
+            f"  base coverage={item['base_coverage']:.4f}, corrected coverage={item['coverage']:.4f}\n"
+            f"  primary corrected coverage MC SE={item['coverage_mc_se']:.4f}\n"
             f"  coverage over all requested={item['coverage_all_requested']:.4f}\n"
             f"  mean center={item['mean_center']:.6f}, mean bias={item['mean_bias']:.6f}\n"
             f"  mean base width={item['mean_base_width']:.6f}, "
@@ -357,6 +423,7 @@ def print_terminal_summary(truth, summaries, baseline_results, save_path, checkp
                 f"T_offline={item['n']}, T={item['T']}, method={item['method']}: "
                 f"coverage={item['coverage']:.4f}, mean width={item['mean_width']:.6f}, "
                 f"valid={item['valid_reps']}, missing={item['missing_reps']}\n"
+                f"  baseline data horizon={item['evaluation_horizon']}, truth horizon={item['T']}\n"
                 f"  target: {item['target_interpretation']}"
             )
     else:
@@ -377,13 +444,15 @@ def clean_json(value):
 def baseline_summary(records, truth):
     output=[]
     for n in sorted({r['n'] for r in records}):
-        group=[r for r in records if r['n']==n]
-        for T, target in truth.items():
+        for T in sorted({r['T'] for r in records if r['n']==n}):
+            group=[r for r in records if r['n']==n and r['T']==T]
+            horizon=group[0]['evaluation_horizon']
+            target=truth[T]
             for name in ('ipw','dr','cadr','elfcb'):
                 intervals=[r['intervals'][name] for r in group]
                 valid=[ci for ci in intervals if ci is not None and np.isfinite(ci).all()]
                 if not valid: continue
-                output.append(dict(n=n,T=T,method=name,valid_reps=len(valid),
+                output.append(dict(n=n,T=T,evaluation_horizon=horizon,method=name,valid_reps=len(valid),
                     missing_reps=len(group)-len(valid),
                     coverage=float(np.mean([lo<=target['value']<=hi for lo,hi in valid])),
                     mean_width=float(np.mean([hi-lo for lo,hi in valid])),
