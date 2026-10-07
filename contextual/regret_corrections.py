@@ -3,17 +3,24 @@ import numpy as np
 from scipy.stats import norm
 
 
-def standardized_mixture(rng, components):
-    """Center and certify a proxy <=1 using component bounds plus Hoeffding.
+def standardized_mixture(rng, components, calibration='subgaussian_proxy'):
+    """Draw and standardize a centered Gaussian mixture.
 
-    For a Gaussian mixture, max component variance + range(means)^2/4
-    is a valid proxy bound. This avoids finite-grid proxy certification.
+    ``subgaussian_proxy`` scales by a sufficient unit sub-Gaussian proxy
+    bound. ``moment_matching`` scales by the mixture's ordinary standard
+    deviation, giving mean zero and variance one exactly (up to floating-point
+    error), without certifying a unit sub-Gaussian proxy.
     """
+    if calibration not in {'subgaussian_proxy','moment_matching'}:
+        raise ValueError('Unknown mixture calibration')
     w = rng.dirichlet(np.ones(components))
     m = rng.normal(size=components); m -= w@m
     s = rng.uniform(.1,1.,components)
-    bound = max(s*s)+np.ptp(m)**2/4
-    return w,m/np.sqrt(bound),s/np.sqrt(bound)
+    if calibration == 'subgaussian_proxy':
+        scale_squared = max(s*s)+np.ptp(m)**2/4
+    else:
+        scale_squared = float(w@(s*s+m*m))
+    return w,m/np.sqrt(scale_squared),s/np.sqrt(scale_squared)
 
 
 class MixtureCandidate:
@@ -128,26 +135,32 @@ def search_mixture_regret(model, policy_builder, context_sampler, horizon,
                           candidate_count=20, components=3, screen_rollouts=50,
                           refine_rollouts=200, n_refine=5, benchmark='unrestricted',
                           epsilon=0., seed=2026, mc_error_probability=.05, *,
-                          backend='python', block_size=128, progress=False):
+                          backend='python', block_size=128, progress=False,
+                          mixture_calibration='subgaussian_proxy'):
     return search_mixture_regret_horizons(
         model,policy_builder,context_sampler,[horizon],candidate_count,components,
         screen_rollouts,refine_rollouts,n_refine,benchmark,epsilon,seed,
-        mc_error_probability,backend=backend,block_size=block_size,progress=progress)[horizon]
+        mc_error_probability,backend=backend,block_size=block_size,progress=progress,
+        mixture_calibration=mixture_calibration)[horizon]
 
 
 def search_mixture_regret_horizons(model, policy_builder, context_sampler, horizons,
                                    candidate_count=20, components=3, screen_rollouts=50,
                                    refine_rollouts=200, n_refine=5, benchmark='unrestricted',
                                    epsilon=0., seed=2026, mc_error_probability=.05, *,
-                                   backend='python', block_size=128, progress=False):
+                                   backend='python', block_size=128, progress=False,
+                                   mixture_calibration='subgaussian_proxy'):
     """Share each candidate trajectory across all requested horizons."""
     checkpoints=sorted(set(int(h) for h in horizons))
     if (candidate_count<1 or components<1 or n_refine<1 or
             refine_rollouts<screen_rollouts or not 0<mc_error_probability<1):
         raise ValueError('Invalid mixture search settings')
+    if mixture_calibration not in {'subgaussian_proxy','moment_matching'}:
+        raise ValueError('Unknown mixture calibration')
     rng=np.random.default_rng(seed);candidates=[model]
     for _ in range(candidate_count-1):
-        candidates.append(MixtureCandidate(model,[standardized_mixture(rng,components) for _ in range(model.n_actions)]))
+        candidates.append(MixtureCandidate(model,[standardized_mixture(rng,components,mixture_calibration)
+                                                   for _ in range(model.n_actions)]))
     screened_samples=[regret_rollouts_horizons(e,policy_builder,context_sampler,checkpoints,screen_rollouts,
                       benchmark,epsilon,seed+10000,backend=backend,block_size=block_size,
                       progress=progress,return_samples=True) for e in candidates]
@@ -171,9 +184,12 @@ def search_mixture_regret_horizons(model, policy_builder, context_sampler, horiz
             refined.append(dict(candidate=int(i),regret=mean,regret_se=se,
                                 mc_adjusted_regret=max(0.,mean+z*se),backend=screened_samples[i]['backend']))
         chosen=max(refined,key=lambda r:r['mc_adjusted_regret'])
+        constraint=('component-bound certified candidates within fitted proxy budget'
+                    if mixture_calibration == 'subgaussian_proxy' else
+                    'candidates match fitted conditional mean and ordinary variance; no proxy certification')
         output[T]=dict(B_T=chosen['mc_adjusted_regret'],method='gaussian_mixture_search',
             guarantee='empirical finite-library search; normal MC adjustment is approximate',
-            proxy_constraint='component-bound certified candidates within fitted proxy budget',
+            mixture_calibration=mixture_calibration,proxy_constraint=constraint,
             candidate_count=candidate_count,
             screened=[dict(regret=float(screen_means[i,j]),backend=screened_samples[i]['backend']) for i in range(candidate_count)],
             refined=refined,raw_max_regret=max(0.,max(r['regret'] for r in refined)),benchmark=benchmark)

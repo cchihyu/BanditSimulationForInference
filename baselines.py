@@ -705,7 +705,6 @@ def elfcb_confidence_interval_repo(
         [[1.0, w / wscale] for w in (wmin, wmax) for r in (rmin, rmax)],
         dtype=np.float64,
     )
-
     retvals = []
     easybounds = [
         (qmle["vmin"] <= rmin + tiny, rmin),

@@ -111,6 +111,13 @@ class SubGaussianTests(unittest.TestCase):
             self.assertAlmostEqual(w@m,0.)
             self.assertLessEqual(max(s*s)+np.ptp(m)**2/4,1+1e-12)
 
+    def test_mixture_moment_matching(self):
+        rng=np.random.default_rng(12)
+        for _ in range(10):
+            w,m,s=standardized_mixture(rng,4,'moment_matching')
+            self.assertAlmostEqual(w@m,0.)
+            self.assertAlmostEqual(w@(s*s+m*m),1.)
+
     def test_cadr_and_bootstrap(self):
         y=np.array([1.,2.,3.,4.]);weights=np.ones(4);x=np.zeros((4,0));a=np.zeros(4,dtype=int);p=np.ones((4,1))
         ci=cadr_interval(y,weights,.95,conditional_sigmas=np.full(4,2.))

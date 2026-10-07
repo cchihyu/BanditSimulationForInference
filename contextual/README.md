@@ -89,10 +89,15 @@ probabilities. The TS observation scale remains fixed across candidate environme
   their screening trajectories.
   `--mixture_components`, `--screen_rollouts`, `--refine_rollouts`, and
   `--mc_error_probability` configure the search. Candidates are analytically scaled
-  using max component variance + component-mean range squared / 4, a sufficient
-  proxy bound. They lie within the fitted dispersion budget; this is a restricted
-  library, not a search over all sub-Gaussian distributions. Normal MC adjustments
-  are approximate and do not account for omitted candidates or parameter error.
+  according to `--mixture_calibration`. Its default, `subgaussian_proxy`, uses max
+  component variance + component-mean range squared / 4, a sufficient proxy bound.
+  The alternative `moment_matching` requires `--variance_methods empirical`; it
+  centers each mixture and scales it to unit ordinary variance. After applying the
+  fitted conditional mean and arm-specific empirical variance, every candidate then
+  matches those two fitted moments exactly. This mode does not certify that the
+  candidate has the fitted sub-Gaussian proxy. Both modes search a restricted
+  finite library. Normal MC adjustments are approximate and do not account for
+  omitted candidates or parameter error.
 * `minimax_bound`: explicitly labeled **minimax-inspired sensitivity formula**, not
   a proven bound for the implemented policy. With proxy budget v and dimension p,
   `linear_dimension` uses C*p*sqrt(v*T*log(T)); `mab_rate` uses

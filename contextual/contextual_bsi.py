@@ -113,8 +113,8 @@ def simulate_svi_summary(reward_model, eval_policy_builder, context_sampler,
             context_sampler, T, n_reps, lambda_params, algo_seed, context_seed)
     values=fast['observed']
     return dict(mean_avg_reward=float(values.mean()),
-                se_avg_reward=float(values.std(ddof=1)/np.sqrt(n_reps)),
-                std_avg_reward=float(values.std(ddof=1)),
+                se_avg_reward=float(values.std(ddof=1)/np.sqrt(n_reps)) if n_reps > 1 else 0.0,
+                std_avg_reward=float(values.std(ddof=1)) if n_reps > 1 else 0.0,
                 trajectory_gradients=fast['trajectory_gradients'],
                 backend='numba', n_rep=n_reps, T=T,
                 algo_seed=algo_seed, context_seed=context_seed)

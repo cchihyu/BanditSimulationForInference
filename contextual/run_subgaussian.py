@@ -69,6 +69,9 @@ def build_parser():
     p.add_argument('--benchmark_epsilon',type=float,default=.1)
     p.add_argument('--candidate_count',type=int,default=20)
     p.add_argument('--mixture_components',type=int,default=3)
+    p.add_argument('--mixture_calibration',choices=['subgaussian_proxy','moment_matching'],
+                   default='subgaussian_proxy',
+                   help='Scale mixture candidates to a unit proxy bound or to exact unit ordinary variance')
     p.add_argument('--screen_rollouts',type=int,default=50)
     p.add_argument('--refine_rollouts',type=int,default=200)
     p.add_argument('--n_refine',type=int,default=5)
@@ -171,14 +174,21 @@ def _replication_task(task):
                 args.candidate_count,args.mixture_components,args.screen_rollouts,args.refine_rollouts,
                 args.n_refine,args.regret_benchmark,args.benchmark_epsilon,seed+600,
                 args.mc_error_probability,backend=args.backend,block_size=args.rollout_block_size,
-                progress=args.progress and args.n_jobs==1)
+                progress=args.progress and args.n_jobs==1,
+                mixture_calibration=args.mixture_calibration)
         for T in args.T_values:
             result,M,m_info,wald,proj,primary=fitted[T]
             for correction in args.regret_methods:
                 if correction == 'gaussian_mixture_search':reg=mixture_by_T[T]
                 else:
-                    proxy=max(env.scales**2/4) if args.env == 'scaled_bernoulli' else max(model.variances)
+                    if args.env in {'scaled_bernoulli', 'beta'}:
+                        proxy=max(env.scales**2/4)
+                        proxy_source='hoeffding_constant'
+                    else:
+                        proxy=max(model.variances)
+                        proxy_source='fitted'
                     reg=minimax_type_regret(T,args.n_actions,model.p,proxy,args.bound_constant,args.bound_formula,args.bound_log)
+                    reg['proxy_source']=proxy_source
                 corrected_svi=expand_interval(wald,reg['B_T'],T)
                 corrected_projection_svi=expand_interval(proj,reg['B_T'],T)
                 corrected=corrected_svi if args.pi0 == 'uniform' else corrected_projection_svi
@@ -249,10 +259,14 @@ def run(args):
         raise ValueError('Positive sample sizes and at least 2 truth replicates required')
     if args.baselines_only and not args.include_baselines:
         raise ValueError('--baselines_only cannot be combined with --no-include_baselines')
-    if not args.baselines_only and args.inner_reps < 2:
-        raise ValueError('SVI requires at least 2 inner simulation replicates')
+    if not args.baselines_only and args.inner_reps < 1:
+        raise ValueError('SVI requires at least 1 inner simulation replicate')
     if not args.baselines_only and args.env == 'gaussian_mixture' and 'hoeffding' in args.variance_methods:
         raise ValueError('Hoeffding is unavailable for Gaussian mixtures')
+    if (not args.baselines_only and 'gaussian_mixture_search' in args.regret_methods and
+            args.mixture_calibration == 'moment_matching' and
+            any(method != 'empirical' for method in args.variance_methods)):
+        raise ValueError('--mixture_calibration moment_matching requires --variance_methods empirical')
     if not args.baselines_only and args.select_M and min(args.M_pilot,args.M_bootstrap_reps,args.Mmax) < 2:
         raise ValueError('Pilot, bootstrap and M budget must each be >=2')
     if not args.baselines_only and args.propagate_variance_uncertainty and 'variance_proxy' in args.variance_methods:
